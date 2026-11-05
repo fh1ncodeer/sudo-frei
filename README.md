@@ -45,7 +45,7 @@ During a grant the user is effectively root, without being asked. That applies t
 
 - **Controlling machine:** bash, ssh, python3 ≥ 3.11 (for `tomllib`); Rust ≥ 1.88 for the TUI.
 - **Targets:** Linux with systemd, sudo and `flock` (util-linux), SSH login as a regular user with sudo rights and a plain lowercase user name.
-- **Tested:** grant, timed expiry and revoke on Arch (systemd 262, sudo 1.9.17p2, NOTAFTER rule) and Debian 13 (systemd 257, sudo 1.9.16p2).
+- **Tested on real hosts:** grant and timed expiry on Arch (systemd 262, sudo 1.9.17p2) and Debian 13 (systemd 257, sudo 1.9.16p2).
 - **Ubuntu 25.10+ with `sudo-rs`:** intended, but untested.
 - **Raspberry Pi OS:** ships `/etc/sudoers.d/010_pi-nopasswd`, so sudo is already passwordless for good there. sudo-frei only makes sense once that file is removed.
 

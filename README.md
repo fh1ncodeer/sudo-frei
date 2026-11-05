@@ -82,3 +82,7 @@ The **SSH key** column shows per host whether the key from `ssh -G HOST` is load
 scripts/sudo-frei-test    # the root flow in a scratch directory, no sudo/ssh
 cargo test
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE). No warranty: this tool writes sudoers rules, read it before you run it.

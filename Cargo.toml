@@ -3,6 +3,7 @@ name = "sudo-frei"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+license = "MIT"
 description = "Time-limited passwordless sudo on your own Linux machines, with a TUI"
 
 [dependencies]

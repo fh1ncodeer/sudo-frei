@@ -1,0 +1,103 @@
+#!/bin/bash
+# sudo-frei-test: check the root steps of sudo-frei (grant, re-grant, failure, revoke)
+# without root, sudo or ssh.
+#
+# The root functions are taken from `sudo-frei _remote` and run as the normal
+# user against a fresh `mktemp -d` sandbox: RULE, MARK, CLEANUP and TSROOT point
+# into it, and systemctl, systemd-run, visudo and install are replaced by small
+# fakes in the sandbox's bin/ that only record calls and write inside the sandbox.
+# Nothing outside the sandbox is written; the sandbox is left in place for inspection.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+S=$(mktemp -d "${TMPDIR:-/tmp}/sudo-frei-test.XXXXXX")
+mkdir -p "$S/bin" "$S/etc/sudoers.d" "$S/etc/tmpfiles.d" "$S/run/sudo/ts"
+: >"$S/units"
+
+# --- fakes ------------------------------------------------------------------
+cat >"$S/bin/systemctl" <<'EOF'
+#!/bin/bash
+# Timers live as lines in $SB/units.
+echo "systemctl $*" >>"$SB/log"
+case $1 in
+  list-units) sed 's/$/ loaded active waiting x/' "$SB/units" ;;
+  stop)
+    shift
+    for u in "$@"; do grep -vxF -- "$u" "$SB/units" >"$SB/units.tmp" || true; mv "$SB/units.tmp" "$SB/units"; done
+    ;;
+esac
+EOF
+cat >"$S/bin/systemd-run" <<'EOF'
+#!/bin/bash
+echo "systemd-run $*" >>"$SB/log"
+[[ -z ${FAIL_RUN:-} ]] || exit 1
+for a in "$@"; do [[ $a == --unit=* ]] && echo "${a#--unit=}.timer" >>"$SB/units"; done
+exit 0
+EOF
+cat >"$S/bin/visudo" <<'EOF'
+#!/bin/bash
+echo "visudo $*" >>"$SB/log"
+EOF
+cat >"$S/bin/install" <<'EOF'
+#!/bin/bash
+# Like install, minus -o/-g (needs root).
+args=()
+while (($#)); do case $1 in -o | -g) shift 2 ;; *) args+=("$1"); shift ;; esac; done
+exec /usr/bin/install "${args[@]}"
+EOF
+chmod +x "$S"/bin/*
+
+# --- root functions from the real script --------------------------------------
+funcs=$(bash -c "$("$here/sudo-frei" _remote)"$'\n'"declare -f root_stop_timers root_revoke root_grant" sudo-frei _none)
+
+root() { # root FUNCTION ARGS... with all paths inside the sandbox
+  env SB="$S" PATH="$S/bin:$PATH" FAIL_RUN="${FAIL_RUN:-}" \
+    RULE="$S/etc/sudoers.d/zz-sudo-frei" CLEANUP="$S/etc/tmpfiles.d/sudo-frei.conf" \
+    MARK="$S/run/sudo-frei-ende" TSROOT="$S/run" UNIT=sudo-frei-ende user=tester uid=1000 \
+    bash -c "set -euo pipefail; $funcs; \"\$@\"" sudo-frei "$@"
+}
+
+fails=0
+check() { # check DESCRIPTION COMMAND...
+  if "${@:2}"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi
+}
+timers() { wc -l <"$S/units"; }
+
+printf 'tester ALL=(ALL:ALL) NOPASSWD: ALL\n' >"$S/rule"
+touch "$S/run/sudo/ts/tester"
+
+# 1. grant
+root root_grant "$S/rule" 2000000000
+check "grant: rule installed" test -f "$S/etc/sudoers.d/zz-sudo-frei"
+check "grant: marker holds end" grep -qx 2000000000 "$S/run/sudo-frei-ende"
+check "grant: boot cleanup lists rule and marker" grep -q zz-sudo-frei "$S/etc/tmpfiles.d/sudo-frei.conf"
+check "grant: exactly one timer" test "$(timers)" -eq 1
+check "grant: deadline in UTC, AccuracySec=1s" grep -q -- '--timer-property=AccuracySec=1s --on-calendar=2033-05-18 03:33:20 UTC' "$S/log"
+check "grant: no temp rule left" test ! -e "$S/etc/sudoers.d/zz-sudo-frei.new"
+
+# 2. re-grant: new timer replaces the old one
+root root_grant "$S/rule" 2000000600
+check "re-grant: still exactly one timer" test "$(timers)" -eq 1
+check "re-grant: it is the new one" grep -q -- '-2000000600-' "$S/units"
+check "re-grant: marker updated" grep -qx 2000000600 "$S/run/sudo-frei-ende"
+
+# 3. re-grant where systemd-run fails: the old timer must survive
+if FAIL_RUN=1 root root_grant "$S/rule" 2000001200 2>/dev/null; then rc=0; else rc=$?; fi
+check "failed re-grant: reports failure" test "$rc" -ne 0
+check "failed re-grant: old timer kept" grep -q -- '-2000000600-' "$S/units"
+check "failed re-grant: old marker kept" grep -qx 2000000600 "$S/run/sudo-frei-ende"
+
+# 4. revoke
+root root_revoke
+check "revoke: rule gone" test ! -e "$S/etc/sudoers.d/zz-sudo-frei"
+check "revoke: marker gone" test ! -e "$S/run/sudo-frei-ende"
+check "revoke: no timers" test "$(timers)" -eq 0
+check "revoke: sudo timestamp gone" test ! -e "$S/run/sudo/ts/tester"
+
+echo
+echo "sandbox: $S"
+if ((fails)); then
+  echo "$fails Prüfung(en) fehlgeschlagen."
+  exit 1
+fi
+echo "alle Prüfungen bestanden."

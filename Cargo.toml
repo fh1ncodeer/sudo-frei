@@ -1,0 +1,12 @@
+[package]
+name = "sudo-frei-tui"
+version = "0.1.0"
+edition = "2024"
+description = "Zeitlich begrenztes sudo ohne Passwort auf eigenen Linux-Rechnern, mit TUI"
+
+[dependencies]
+chrono = "0.4.45"
+libc = "0.2.191"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.0"

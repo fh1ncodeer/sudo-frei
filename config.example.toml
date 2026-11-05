@@ -1,0 +1,17 @@
+# sudo-frei: Konfiguration für scripts/sudo-frei und sudo-frei-tui.
+# Ort: ~/.config/sudo-frei/config.toml
+
+# Rechner in dieser Reihenfolge. Namen wie bei ssh: Tailscale-Name oder Eintrag
+# in ~/.ssh/config. "local" (oder der eigene Hostname) ist dieser Rechner.
+# Ziel: Linux mit systemd und sudo (Arch, Debian, Ubuntu, Raspberry Pi OS).
+hosts = ["local", "laptop", "server", "pi"]
+
+# Ab hier nur für die TUI.
+# Vorschläge im Freigabe-Dialog (←/→), in Minuten, höchstens 240.
+presets = [5, 15, 30, 60]
+# Vorauswahl im Freigabe-Dialog.
+default_minutes = 30
+# Alle so viele Sekunden neu prüfen.
+refresh_seconds = 30
+# Skript, falls nicht als "sudo-frei" im PATH.
+# script = "/pfad/zu/sudo-frei/scripts/sudo-frei"

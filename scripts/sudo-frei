@@ -1,0 +1,241 @@
+#!/bin/bash
+# sudo-frei: time-limited passwordless sudo on your Linux machines, controlled from one place.
+#
+#   sudo-frei grant HOST [MINUTES]   enable for MINUTES (default 30, max 240); asks for HOST's sudo password once
+#   sudo-frei revoke HOST            end early
+#   sudo-frei status [--raw] [HOST...]  show state (default: hosts from the config)
+#
+# HOST is an ssh name (e.g. Tailscale MagicDNS or ~/.ssh/config); "local" or this machine's
+# hostname means this machine.
+# Hosts come from ~/.config/sudo-frei/config.toml (`hosts = [...]`, see
+# config.example.toml); without it, only this machine.
+# --raw prints one tab-separated line per host for scripts and the TUI:
+#   HOST<TAB>an<TAB>END_EPOCH | HOST<TAB>aus<TAB> | HOST<TAB>offline<TAB>
+# The rule applies to the user ssh logs in as. Nothing is installed on HOST; the
+# code below is sent along with each call.
+#
+# A grant ends in three ways, whichever comes first:
+#   - a transient systemd timer on HOST removes the rule after MINUTES,
+#   - `sudo-frei revoke HOST`,
+#   - a reboot of HOST: systemd-tmpfiles deletes the rule at boot, so a timer
+#     lost to a reboot never leaves passwordless sudo behind.
+# Targets: systemd Linux with sudo (Arch, Debian, Ubuntu, Raspberry Pi OS).
+# Raspberry Pi OS ships /etc/sudoers.d/010_pi-nopasswd, which makes sudo
+# passwordless permanently; sudo-frei only means something there once that file is gone.
+# The timer also deletes the user's sudo timestamp, so sudo's usual 5-minute
+# grace period does not extend the window.
+set -euo pipefail
+
+CONFIG=${SUDO_FREI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sudo-frei/config.toml}
+FALLBACK_HOSTS=(local)
+DEFAULT_MIN=30
+MAX_MIN=240
+STATUS_TIMEOUT=2.3
+
+# Runs on the target host as the login user: bash -c "$REMOTE" sudo-frei ACTION [MINUTES]
+read -r -d '' REMOTE <<'EOF' || true
+set -euo pipefail
+RULE=/etc/sudoers.d/zz-sudo-frei
+CLEANUP=/etc/tmpfiles.d/sudo-frei.conf
+# World-readable marker holding the grant's end (epoch). It is created and
+# removed together with RULE, so the user can see the state without sudo
+# (/etc/sudoers.d itself is not readable).
+MARK=/run/sudo-frei-ende
+# Directory holding sudo/ts and sudo-rs/ts timestamps; overridable only for scripts/sudo-frei-test.
+TSROOT=/run
+UNIT=sudo-frei-ende
+host=$(uname -n)
+user=$(id -un)
+uid=$(id -u)
+die() { echo "sudo-frei@$host: $*" >&2; exit 1; }
+[[ $uid -ne 0 ]] || die "login user is root; sudo-frei is for normal users."
+
+# root_* run as root inside ONE sudo call with HUP/INT/TERM ignored, so a
+# dropped connection or Ctrl-C cannot stop them between steps.
+root_stop_timers() { # stop all sudo-frei timers except unit $1
+  local u
+  for u in $(systemctl list-units --all --plain --no-legend --type=timer "$UNIT*" | awk '{print $1}'); do
+    [[ -n ${1:-} && $u == "$1.timer" ]] && continue
+    systemctl stop "$u" "${u%.timer}.service" 2>/dev/null || true
+    systemctl reset-failed "$u" "${u%.timer}.service" 2>/dev/null || true
+  done
+}
+root_revoke() {
+  trap '' HUP INT TERM
+  # Rule first: whatever happens afterwards, nothing passwordless is left.
+  rm -f "$RULE" "$MARK"
+  root_stop_timers
+  rm -f "$TSROOT/sudo/ts/$user" "$TSROOT/sudo-rs/ts/$user" "$TSROOT/sudo-rs/ts/$uid"
+}
+root_grant() { # $1 = candidate rule file, $2 = end epoch
+  trap '' HUP INT TERM
+  local tmp=$1 end=$2 unit="$UNIT-$2-$$"
+  # Plain -c -f (no -q): also understood by sudo-rs, Ubuntu's default sudo since 25.10.
+  visudo -c -f "$tmp" >/dev/null || { echo "Regel ungültig, nichts geändert." >&2; return 1; }
+  # Order: boot cleanup, new timer, old timers off, then marker and rule. A
+  # failure before the last step leaves either nothing or a rule that still
+  # has a running timer; the old timer is only stopped once the new one exists.
+  printf 'r %s\nr %s\n' "$RULE" "$MARK" | install -o root -g root -m 0644 /dev/stdin "$CLEANUP"
+  # Wall-clock deadline in UTC, not --on-active: monotonic timers pause during
+  # suspend, and local times are ambiguous at the DST switch. A calendar timer
+  # whose time passed during suspend fires on resume. AccuracySec defaults to 1 min.
+  systemd-run --quiet --collect --unit="$unit" --timer-property=AccuracySec=1s \
+    --on-calendar="$(date -u -d "@$end" '+%Y-%m-%d %H:%M:%S') UTC" \
+    /usr/bin/rm -f "$RULE" "$MARK" "$TSROOT/sudo/ts/$user" "$TSROOT/sudo-rs/ts/$user" "$TSROOT/sudo-rs/ts/$uid"
+  root_stop_timers "$unit"
+  printf '%s\n' "$end" | install -o root -g root -m 0444 /dev/stdin "$MARK"
+  # Write under a name with a dot (sudo skips those in sudoers.d), then rename
+  # atomically, so sudo never reads a half-written rule.
+  install -o root -g root -m 0440 "$tmp" "$RULE.new"
+  mv -f "$RULE.new" "$RULE"
+  if ! visudo -c >/dev/null; then
+    rm -f "$RULE" "$MARK"
+    root_stop_timers
+    echo "sudoers-Prüfung fehlgeschlagen, Regel wieder entfernt." >&2
+    return 1
+  fi
+}
+as_root() { # as_root FUNCTION ARGS...
+  sudo env RULE="$RULE" CLEANUP="$CLEANUP" MARK="$MARK" UNIT="$UNIT" TSROOT="$TSROOT" user="$user" uid="$uid" \
+    bash -c "set -euo pipefail; $(declare -f root_stop_timers root_revoke root_grant); \"\$@\"" sudo-frei "$@"
+}
+
+case $1 in
+  state)
+    # "an END_EPOCH", "aus", or "verwaist" (rule without timer); needs no sudo.
+    if [[ -e $MARK ]]; then
+      read -r end <"$MARK" || end=""
+      [[ $end =~ ^[0-9]+$ ]] || end=0
+      if systemctl list-units --plain --no-legend --type=timer --state=active "$UNIT*" | grep -q .; then
+        echo "an $end"
+      else
+        echo "verwaist"
+      fi
+    else
+      echo "aus"
+    fi
+    ;;
+  revoke)
+    as_root root_revoke || die "Widerruf fehlgeschlagen."
+    sudo -K 2>/dev/null || true
+    echo "$host: aus, sudo fragt wieder nach dem Passwort."
+    ;;
+  grant)
+    min=$2
+    end=$(( $(date +%s) + min * 60 ))
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' EXIT
+    chmod 0644 "$tmp"
+    printf '# Written by sudo-frei; removed by %s-*.timer and at boot (%s).\n%s ALL=(ALL:ALL) NOPASSWD: ALL\n' \
+      "$UNIT" "$CLEANUP" "$user" >"$tmp"
+    as_root root_grant "$tmp" "$end" || die "nicht freigegeben."
+    echo "$host: an für $user bis $(date -d "@$end" '+%H:%M %Z') ($min min)."
+    ;;
+esac
+EOF
+
+die() { echo "sudo-frei: $*" >&2; exit 1; }
+usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; }
+
+config_hosts() {
+  if [[ -f $CONFIG ]]; then
+    local hosts
+    hosts=$(python3 -I -c 'import sys, tomllib
+print(*tomllib.load(open(sys.argv[1], "rb")).get("hosts") or [], sep="\n")' "$CONFIG") ||
+      die "$CONFIG: konnte hosts nicht lesen."
+    if [[ -n ${hosts//[[:space:]]/} ]]; then
+      grep -v '^[[:space:]]*$' <<<"$hosts"
+      return
+    fi
+  fi
+  printf '%s\n' "${FALLBACK_HOSTS[@]}"
+}
+
+is_local() { [[ $1 == local || $1 == "$(uname -n)" ]]; }
+
+# run_on HOST ACTION [MINUTES]; interactive=1 allocates a tty so sudo can ask for the password.
+run_on() {
+  local host=$1 interactive=$2
+  shift 2
+  [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "ungültiger Rechnername: $host"
+  if is_local "$host"; then
+    bash -c "$REMOTE" sudo-frei "$@"
+    return
+  fi
+  local b64 opts=(-o ConnectTimeout=8)
+  b64=$(base64 -w0 <<<"$REMOTE")
+  if (( interactive )) && [[ -t 0 ]]; then
+    opts+=(-t)
+  else
+    opts+=(-o BatchMode=yes)
+  fi
+  # Arguments are validated words (grant/revoke/state, a number), safe to pass unquoted.
+  ssh "${opts[@]}" "$host" "bash -c \"\$(echo $b64 | base64 -d)\" sudo-frei $*"
+}
+
+action=${1:-}
+case $action in
+  grant)
+    host=${2:-} min=${3:-$DEFAULT_MIN}
+    [[ -n $host ]] || die "welcher Rechner? sudo-frei grant HOST [MINUTEN]"
+    [[ $min =~ ^[0-9]+$ ]] && (( min >= 1 && min <= MAX_MIN )) ||
+      die "Minuten müssen zwischen 1 und $MAX_MIN liegen."
+    run_on "$host" 1 grant "$min"
+    ;;
+  revoke)
+    host=${2:-}
+    [[ -n $host ]] || die "welcher Rechner? sudo-frei revoke HOST"
+    run_on "$host" 1 revoke
+    ;;
+  status)
+    shift
+    raw=0
+    [[ ${1:-} == --raw ]] && { raw=1; shift; }
+    hosts=("$@")
+    (( ${#hosts[@]} )) || mapfile -t hosts < <(config_hosts)
+    # All hosts in parallel, each capped at STATUS_TIMEOUT, printed in the given order.
+    out=$(mktemp -d)
+    trap 'rm -rf "$out"' EXIT
+    for i in "${!hosts[@]}"; do
+      (
+        timeout "$STATUS_TIMEOUT" "$0" _state1 "${hosts[$i]}" >"$out/$i" 2>/dev/null ||
+          echo offline >"$out/$i"
+      ) &
+    done
+    wait
+    now=$(date +%s)
+    for i in "${!hosts[@]}"; do
+      h=${hosts[$i]}
+      state=offline end=""
+      read -r state end <"$out/$i" || true
+      # Remote output is untrusted: only known words, and a plain number for
+      # "an" (bash would evaluate e.g. x[$(cmd)] inside $(( ))).
+      case $state in
+        an) [[ $end =~ ^[0-9]+$ ]] || state=offline ;;
+        aus | verwaist) end="" ;;
+        *) state=offline end="" ;;
+      esac
+      if (( raw )); then
+        printf '%s\t%s\t%s\n' "$h" "$state" "$end"
+      elif [[ $state == an ]]; then
+        echo "$h: an bis $(date -d "@$end" +%H:%M) (noch $(( (end - now + 59) / 60 )) min)"
+      elif [[ $state == aus ]]; then
+        echo "$h: aus"
+      elif [[ $state == verwaist ]]; then
+        echo "$h: WARNUNG sudo ohne Passwort, aber ohne Ablauf-Timer. Beenden: sudo-frei revoke $h"
+      else
+        echo "$h: nicht erreichbar"
+      fi
+    done
+    ;;
+  _remote)
+    # Internal: print the code that runs on the target, for scripts/sudo-frei-test.
+    printf '%s\n' "$REMOTE"
+    ;;
+  _state1)
+    # Internal: one host's state line, run under timeout by `status`.
+    run_on "$2" 0 state
+    ;;
+  -h | --help | help | "") usage ;;
+  *) die "unbekannt: $action (grant, revoke, status)" ;;
+esac

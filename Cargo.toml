@@ -1,8 +1,9 @@
 [package]
-name = "sudo-frei-tui"
+name = "sudo-frei"
 version = "0.1.0"
 edition = "2024"
-description = "Zeitlich begrenztes sudo ohne Passwort auf eigenen Linux-Rechnern, mit TUI"
+rust-version = "1.88"
+description = "Time-limited passwordless sudo on your own Linux machines, with a TUI"
 
 [dependencies]
 chrono = "0.4.45"

@@ -1385,7 +1385,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sudo-frei-tui"
+name = "sudo-frei"
 version = "0.1.0"
 dependencies = [
  "chrono",

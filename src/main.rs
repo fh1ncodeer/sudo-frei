@@ -1,7 +1,7 @@
-//! sudo-frei-tui: terminal UI for scripts/sudo-frei.
+//! sudo-frei: terminal UI for scripts/sudo-frei-cli.
 //!
 //! The bash script stays the only thing that touches hosts; this UI shows
-//! `sudo-frei status --raw` and runs `sudo-frei grant|revoke` with the real
+//! `sudo-frei-cli status --raw` and runs `sudo-frei-cli grant|revoke` with the real
 //! terminal handed over, so sudo can ask for a password the usual way.
 //! It also shows the SSH agent: which keys in ~/.ssh are loaded and whether
 //! each host's key (from `ssh -G`) is, since grant/revoke need it.
@@ -66,7 +66,7 @@ fn default_refresh() -> u64 {
     30
 }
 fn default_script() -> String {
-    "sudo-frei".into()
+    "sudo-frei-cli".into()
 }
 
 impl Default for Config {
@@ -101,13 +101,13 @@ fn load_config() -> Result<Config, String> {
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     if cfg.presets.iter().any(|&m| m == 0 || m > MAX_MIN) {
-        return Err(format!("{}: presets müssen zwischen 1 und {MAX_MIN} liegen", path.display()));
+        return Err(format!("{}: presets must be between 1 and {MAX_MIN}", path.display()));
     }
     if cfg.refresh_seconds == 0 {
-        return Err(format!("{}: refresh_seconds muss mindestens 1 sein", path.display()));
+        return Err(format!("{}: refresh_seconds must be at least 1", path.display()));
     }
     if cfg.default_minutes == 0 || cfg.default_minutes > MAX_MIN {
-        return Err(format!("{}: default_minutes muss zwischen 1 und {MAX_MIN} liegen", path.display()));
+        return Err(format!("{}: default_minutes must be between 1 and {MAX_MIN}", path.display()));
     }
     Ok(cfg)
 }
@@ -130,9 +130,9 @@ fn parse_status(out: &str) -> Vec<(String, State)> {
             let mut f = line.split('\t');
             let host = f.next()?.to_string();
             let state = match (f.next()?, f.next().unwrap_or("")) {
-                ("an", end) => end.parse().map(State::On).unwrap_or(State::Unknown),
-                ("aus", _) => State::Off,
-                ("verwaist", _) => State::Orphan,
+                ("on", end) => end.parse().map(State::On).unwrap_or(State::Unknown),
+                ("off", _) => State::Off,
+                ("orphan", _) => State::Orphan,
                 _ => State::Offline,
             };
             Some((host, state))
@@ -406,7 +406,7 @@ impl App {
                         self.table.select(Some(0));
                     }
                 }
-                Err(e) => self.flash(format!("Status fehlgeschlagen: {e}")),
+                Err(e) => self.flash(format!("status failed: {e}")),
             }
         }
     }
@@ -484,7 +484,7 @@ fn run_external(terminal: &mut DefaultTerminal, program: &str, args: &[&str]) ->
     // SAFETY: restores the handler that was active before.
     unsafe { libc::signal(libc::SIGINT, previous) };
     if !ok {
-        print!("\nFehlgeschlagen. Enter zum Zurückkehren … ");
+        print!("\nFailed. Press Enter to return … ");
         io::stdout().flush()?;
         let mut line = String::new();
         io::stdin().read_line(&mut line)?;
@@ -500,7 +500,7 @@ fn add_key(app: &mut App, terminal: &mut DefaultTerminal, i: usize) -> io::Resul
     let path = app.key_files[i].private.to_string_lossy().into_owned();
     let name = app.key_files[i].name.clone();
     if run_external(terminal, "ssh-add", &[&path])? {
-        app.flash(format!("Schlüssel {name} geladen."));
+        app.flash(format!("key {name} loaded."));
     }
     app.reread_agent();
     Ok(())
@@ -520,34 +520,31 @@ fn handle_key(app: &mut App, terminal: &mut DefaultTerminal, code: KeyCode, mods
                 app.reread_agent();
                 app.refresh();
             }
-            KeyCode::Char('g') | KeyCode::Enter => match app.selected().map(|r| r.state.clone()) {
-                Some(State::Offline) => app.flash("Rechner nicht erreichbar.".into()),
-                Some(_) => app.mode = Mode::Grant { input: app.cfg.default_minutes.to_string() },
-                None => {}
-            },
+            // "offline" only means the non-interactive probe failed (e.g. a key
+            // that needs its passphrase); an interactive grant may still work.
+            KeyCode::Char('g') | KeyCode::Enter => {
+                if app.selected().is_some() {
+                    app.mode = Mode::Grant { input: app.cfg.default_minutes.to_string() };
+                }
+            }
             KeyCode::Char('r') => {
                 let Some(row) = app.selected() else { return Ok(()) };
+                // Revoke even if the last probe said off or offline: it may be stale.
                 let host = row.name.clone();
-                match row.state {
-                    State::Off => app.flash(format!("{host} ist schon aus.")),
-                    State::Offline => app.flash("Rechner nicht erreichbar.".into()),
-                    _ => {
-                        let script = app.cfg.script.clone();
-                        if run_external(terminal, &script, &["revoke", &host])? {
-                            app.flash(format!("{host}: widerrufen."));
-                        }
-                        app.refresh();
-                    }
+                let script = app.cfg.script.clone();
+                if run_external(terminal, &script, &["revoke", &host])? {
+                    app.flash(format!("{host}: revoked."));
                 }
+                app.refresh();
             }
             KeyCode::Char('a') => {
                 if matches!(app.agent, AgentState::NoAgent) {
-                    app.flash("Kein SSH-Agent erreichbar (SSH_AUTH_SOCK).".into());
+                    app.flash("no SSH agent reachable (SSH_AUTH_SOCK).".into());
                     return Ok(());
                 }
                 let candidates = app.unloaded_keys();
                 match candidates.len() {
-                    0 => app.flash("Alle Schlüssel aus ~/.ssh sind geladen.".into()),
+                    0 => app.flash("all keys from ~/.ssh are loaded.".into()),
                     1 => add_key(app, terminal, candidates[0])?,
                     _ => app.mode = Mode::AddKey { candidates },
                 }
@@ -561,7 +558,7 @@ fn handle_key(app: &mut App, terminal: &mut DefaultTerminal, code: KeyCode, mods
                     .status()
                     .is_ok_and(|s| s.success());
                 app.reread_agent();
-                app.flash(if ok { "Agent geleert.".into() } else { "Agent leeren fehlgeschlagen.".into() });
+                app.flash(if ok { "agent cleared.".into() } else { "clearing the agent failed.".into() });
             }
             _ => {}
         },
@@ -599,14 +596,14 @@ fn handle_key(app: &mut App, terminal: &mut DefaultTerminal, code: KeyCode, mods
             KeyCode::Enter => {
                 let min: u32 = input.parse().unwrap_or(0);
                 if !(1..=MAX_MIN).contains(&min) {
-                    app.flash(format!("Minuten: 1 bis {MAX_MIN}."));
+                    app.flash(format!("minutes: 1 to {MAX_MIN}."));
                     return Ok(());
                 }
                 app.mode = Mode::Normal;
                 let Some(host) = app.selected().map(|r| r.name.clone()) else { return Ok(()) };
                 let script = app.cfg.script.clone();
                 if run_external(terminal, &script, &["grant", &host, &min.to_string()])? {
-                    app.flash(format!("{host}: frei für {min} min."));
+                    app.flash(format!("{host}: on for {min} min."));
                 }
                 app.refresh();
             }
@@ -624,7 +621,7 @@ fn fmt_clock(epoch: i64) -> String {
 
 fn fmt_left(secs: i64) -> String {
     if secs <= 0 {
-        return "läuft ab …".into();
+        return "expiring …".into();
     }
     if secs >= 3600 {
         format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
@@ -650,10 +647,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
 
     let status = if app.refreshing {
-        "prüfe …".to_string()
+        "checking …".to_string()
     } else {
         match app.last_refresh {
-            Some(t) => format!("geprüft vor {} s", t.elapsed().as_secs()),
+            Some(t) => format!("checked {} s ago", t.elapsed().as_secs()),
             None => String::new(),
         }
     };
@@ -670,26 +667,26 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .map(|r| {
             let (state, until, left, style) = match r.state {
                 State::On(end) => (
-                    "frei",
+                    "on",
                     fmt_clock(end),
                     fmt_left(end - now),
                     Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
-                State::Off => ("aus", String::new(), String::new(), Style::new().fg(Color::Green)),
+                State::Off => ("off", String::new(), String::new(), Style::new().fg(Color::Green)),
                 State::Orphan => (
-                    "verwaist",
+                    "orphan",
                     String::new(),
-                    "ohne Timer!".into(),
+                    "no timer!".into(),
                     Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 State::Offline => ("offline", String::new(), String::new(), Style::new().fg(Color::DarkGray)),
                 State::Unknown => ("…", String::new(), String::new(), Style::new().fg(Color::DarkGray)),
             };
             let key = match key_ready(&r.name, &r.keys, &app.key_files, &loaded) {
-                KeyReady::Local => Cell::from("lokal").dim(),
+                KeyReady::Local => Cell::from("local").dim(),
                 KeyReady::Loaded(name) => Cell::from(format!("✓ {name}")).green(),
                 KeyReady::Maybe => Cell::from("? Agent").yellow(),
-                KeyReady::Missing => Cell::from("✗ fehlt").red(),
+                KeyReady::Missing => Cell::from("✗ missing").red(),
             };
             Row::new(vec![Cell::from(r.name.clone()), Cell::from(state).style(style), Cell::from(until), Cell::from(left), key])
         })
@@ -704,7 +701,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Constraint::Min(10),
         ],
     )
-    .header(Row::new(["Rechner", "sudo", "bis", "Rest", "SSH-Schlüssel"]).style(Style::new().dim()))
+    .header(Row::new(["host", "sudo", "until", "left", "SSH key"]).style(Style::new().dim()))
     .row_highlight_style(Style::new().reversed())
     .highlight_symbol("› ")
     .block(Block::bordered());
@@ -713,9 +710,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(agent_lines).block(Block::bordered().title(" SSH-Agent ")), agent);
 
     let keys = match app.mode {
-        Mode::Normal => " ↑↓ wählen  g freigeben  r widerrufen  a Schlüssel laden  x Agent leeren  u prüfen  q beenden",
-        Mode::Grant { .. } => " Zahl tippen  ←→ Vorschläge  Enter freigeben  Esc abbrechen",
-        Mode::AddKey { .. } => " Ziffer wählt den Schlüssel  Esc abbrechen",
+        Mode::Normal => " ↑↓ select  g grant  r revoke  a add key  x clear agent  u refresh  q quit",
+        Mode::Grant { .. } => " type minutes  ←→ presets  Enter grant  Esc cancel",
+        Mode::AddKey { .. } => " digit picks the key  Esc cancel",
     };
     frame.render_widget(Line::from(keys).dim(), help);
     if let Some((text, _)) = &app.message {
@@ -732,7 +729,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 /// Keys in ~/.ssh with their agent state, then agent keys without a file (e.g. forwarded).
 fn agent_panel(app: &App) -> Vec<Line<'static>> {
     let keys = match &app.agent {
-        AgentState::NoAgent => return vec![Line::from("kein Agent erreichbar (SSH_AUTH_SOCK)").red()],
+        AgentState::NoAgent => return vec![Line::from("no agent reachable (SSH_AUTH_SOCK)").red()],
         AgentState::Keys(k) => k,
     };
     let loaded: HashSet<&str> = keys.iter().map(|k| k.fp.as_str()).collect();
@@ -741,7 +738,7 @@ fn agent_panel(app: &App) -> Vec<Line<'static>> {
         .iter()
         .map(|k| {
             let on = loaded.contains(k.id.fp.as_str());
-            let mark = if on { Span::from("● geladen ").green() } else { Span::from("○ nicht geladen ").dim() };
+            let mark = if on { Span::from("● loaded ").green() } else { Span::from("○ not loaded ").dim() };
             Line::from(vec![
                 mark,
                 Span::from(format!("{:<12}", k.name)).bold(),
@@ -751,13 +748,13 @@ fn agent_panel(app: &App) -> Vec<Line<'static>> {
         .collect();
     for k in keys.iter().filter(|k| !app.key_files.iter().any(|f| f.id.fp == k.fp)) {
         lines.push(Line::from(vec![
-            Span::from("● geladen ").green(),
+            Span::from("● loaded ").green(),
             Span::from(format!("{:<12}", k.comment)).bold(),
-            Span::from(format!(" {:<8} {} (keine Datei in ~/.ssh)", k.kind, short_fp(&k.fp))).dim(),
+            Span::from(format!(" {:<8} {} (no file in ~/.ssh)", k.kind, short_fp(&k.fp))).dim(),
         ]));
     }
     if lines.is_empty() {
-        lines.push(Line::from("keine Schlüssel").dim());
+        lines.push(Line::from("no keys").dim());
     }
     lines
 }
@@ -774,18 +771,18 @@ fn draw_grant(frame: &mut Frame, app: &App, input: &str) {
         })
         .collect::<Vec<_>>();
     let mut text = vec![
-        Line::from(vec![Span::from("Minuten: "), Span::from(format!("{input}▏")).bold()]),
+        Line::from(vec![Span::from("minutes: "), Span::from(format!("{input}▏")).bold()]),
         Line::from(presets),
         Line::from(""),
-        Line::from(format!("Danach fragt {host} ggf. nach dem sudo-Passwort.")).dim(),
+        Line::from(format!("{host} may then ask for the sudo password.")).dim(),
     ];
     if let Some(r) = app.selected()
         && key_ready(&r.name, &r.keys, &app.key_files, &app.loaded_fps()) == KeyReady::Missing {
-            text.push(Line::from("Schlüssel nicht geladen: ssh fragt nach der Passphrase.").yellow());
+            text.push(Line::from("key not loaded: ssh will ask for the passphrase.").yellow());
         }
     let area = centered(frame.area(), 58, text.len() as u16 + 2);
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(text).block(Block::bordered().title(format!(" {host} freigeben "))), area);
+    frame.render_widget(Paragraph::new(text).block(Block::bordered().title(format!(" grant {host} "))), area);
 }
 
 fn draw_add_key(frame: &mut Frame, app: &App, candidates: &[usize]) {
@@ -804,7 +801,7 @@ fn draw_add_key(frame: &mut Frame, app: &App, candidates: &[usize]) {
         .collect();
     let area = centered(frame.area(), 58, text.len() as u16 + 2);
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(text).block(Block::bordered().title(" Schlüssel laden ")), area);
+    frame.render_widget(Paragraph::new(text).block(Block::bordered().title(" add key ")), area);
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -831,8 +828,8 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
 fn main() {
     if env::args().any(|a| a == "-h" || a == "--help") {
         println!(
-            "sudo-frei-tui: zeitlich begrenztes sudo ohne Passwort, Oberfläche für sudo-frei.\n\
-             Konfiguration: {} (hosts, presets, default_minutes, refresh_seconds, script)",
+            "sudo-frei: time-limited passwordless sudo, the TUI for sudo-frei-cli.\n\
+             config: {} (hosts, presets, default_minutes, refresh_seconds, script)",
             config_path().display()
         );
         return;
@@ -840,7 +837,7 @@ fn main() {
     let cfg = match load_config() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("sudo-frei-tui: {e}");
+            eprintln!("sudo-frei: {e}");
             std::process::exit(1);
         }
     };
@@ -851,7 +848,7 @@ fn main() {
     drop(terminal);
     ratatui::restore();
     if let Err(e) = result {
-        eprintln!("sudo-frei-tui: {e}");
+        eprintln!("sudo-frei: {e}");
         std::process::exit(1);
     }
 }
@@ -862,7 +859,7 @@ mod tests {
 
     #[test]
     fn parses_raw_status() {
-        let out = "local\taus\t\nlaptop\tan\t1793900000\nserver\toffline\t\nbad line\npi\tverwaist\t\n";
+        let out = "local\toff\t\nlaptop\ton\t1793900000\nserver\toffline\t\nbad line\npi\torphan\t\n";
         let got = parse_status(out);
         assert_eq!(got[0], ("local".into(), State::Off));
         assert_eq!(got[1], ("laptop".into(), State::On(1793900000)));

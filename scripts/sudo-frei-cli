@@ -1,0 +1,312 @@
+#!/bin/bash
+# sudo-frei-cli: time-limited passwordless sudo on your Linux machines, controlled from one place.
+# The command line half of sudo-frei; `sudo-frei` itself is the TUI on top of it.
+#
+#   sudo-frei-cli grant HOST [MINUTES]   enable for MINUTES (default 30, max 240); asks for HOST's sudo password once
+#   sudo-frei-cli revoke HOST            end early
+#   sudo-frei-cli status [--raw] [HOST...]  show state (default: hosts from the config)
+#
+# HOST is an ssh name (e.g. Tailscale MagicDNS or ~/.ssh/config); "local" or this machine's
+# hostname means this machine.
+# Hosts come from ~/.config/sudo-frei/config.toml (`hosts = [...]`, see
+# config.example.toml); without it, only this machine.
+# --raw prints one tab-separated line per host for scripts and the TUI:
+#   HOST<TAB>on<TAB>END_EPOCH | HOST<TAB>off<TAB> | HOST<TAB>orphan<TAB> | HOST<TAB>offline<TAB>
+# (orphan: the rule is in place but its expiry timer is gone; revoke it).
+# The rule applies to the user ssh logs in as. Nothing is installed on HOST; the
+# code below is sent along with each call.
+#
+# A grant ends in three ways, whichever comes first:
+#   - a transient systemd timer on HOST removes the rule after MINUTES,
+#   - `sudo-frei-cli revoke HOST`,
+#   - a reboot of HOST: systemd-tmpfiles deletes the rule at boot, so a timer
+#     lost to a reboot never leaves passwordless sudo behind.
+# Targets: systemd Linux with sudo (Arch, Debian, Ubuntu, Raspberry Pi OS).
+# Raspberry Pi OS ships /etc/sudoers.d/010_pi-nopasswd, which makes sudo
+# passwordless permanently; sudo-frei only means something there once that file is gone.
+# The timer also deletes the user's sudo timestamp, so sudo's usual 5-minute
+# grace period does not extend the window.
+set -euo pipefail
+
+CONFIG=${SUDO_FREI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sudo-frei/config.toml}
+FALLBACK_HOSTS=(local)
+DEFAULT_MIN=30
+MAX_MIN=240
+STATUS_TIMEOUT=2.3
+
+# Runs on the target host as the login user: bash -c "$REMOTE" sudo-frei ACTION [MINUTES]
+read -r -d '' REMOTE <<'EOF' || true
+set -euo pipefail
+RULE=/etc/sudoers.d/zz-sudo-frei
+CLEANUP=/etc/tmpfiles.d/sudo-frei.conf
+# World-readable marker holding the grant's end (epoch). It is created and
+# removed together with RULE, so the user can see the state without sudo
+# (/etc/sudoers.d itself is not readable).
+MARK=/run/sudo-frei-until
+# Serializes grant and revoke, so two of them cannot interleave.
+# In a root-only directory: flock works on read-only fds, so a lock file anyone
+# can open could be held by any local user to stall expiry.
+LOCK=/run/sudo-frei/lock
+LOCK_WAIT=60
+# Names used by versions before the English rename; still cleaned up.
+LEGACY_MARK=/run/sudo-frei-ende
+LEGACY_UNIT=sudo-frei-ende
+# Directory holding sudo/ts and sudo-rs/ts timestamps; overridable only for scripts/sudo-frei-test.
+TSROOT=/run
+UNIT=sudo-frei-expire
+MAX_MIN=240
+host=$(uname -n)
+user=$(id -un)
+uid=$(id -u)
+die() { echo "sudo-frei@$host: $*" >&2; exit 1; }
+[[ $uid -ne 0 ]] || die "login user is root; sudo-frei is for normal users."
+# The name goes into sudoers as is; keep it to plain names (no ALL, %group, #uid, quoting).
+[[ $user =~ ^[a-z_][a-z0-9_.-]*$ ]] || die "user name '$user' is not supported."
+
+# root_* run as root inside ONE sudo call with HUP/INT/TERM ignored, so a
+# dropped connection or Ctrl-C cannot stop them between steps.
+root_lock() {
+  install -d -o root -g root -m 0700 "${LOCK%/*}"
+  exec 9>"$LOCK"
+  flock -w "$LOCK_WAIT" 9 || { echo "another sudo-frei run holds $LOCK, try again." >&2; return 1; }
+}
+root_stop_timers() { # stop all sudo-frei timers except unit $1
+  local u
+  for u in $(systemctl list-units --all --plain --no-legend --type=timer "$UNIT*" "$LEGACY_UNIT*" | awk '{print $1}'); do
+    [[ -n ${1:-} && $u == "$1.timer" ]] && continue
+    systemctl stop "$u" "${u%.timer}.service" 2>/dev/null || true
+    systemctl reset-failed "$u" "${u%.timer}.service" 2>/dev/null || true
+  done
+}
+root_ts_files() { # the user's sudo timestamps; sudo >= 1.9.15 names them by uid, older ones and sudo-rs vary
+  printf '%s\n' "$TSROOT/sudo/ts/$user" "$TSROOT/sudo/ts/$uid" "$TSROOT/sudo-rs/ts/$user" "$TSROOT/sudo-rs/ts/$uid"
+}
+root_revoke() {
+  trap '' HUP INT TERM
+  root_lock
+  # Rule first: whatever happens afterwards, nothing passwordless is left.
+  rm -f "$RULE" "$RULE.new" "$MARK" "$MARK.new" "$LEGACY_MARK"
+  root_stop_timers
+  local ts
+  mapfile -t ts < <(root_ts_files)
+  rm -f "${ts[@]}"
+}
+root_stage() { # write rule line $1 to RULE.new (sudo skips names with a dot); 2 = write failed, 1 = rejected
+  # Explicit returns: callers use this in a condition, where set -e is off.
+  printf '# Written by sudo-frei; removed by %s-*.timer and at boot (%s).\n%s\n' "$UNIT" "$CLEANUP" "$1" |
+    install -o root -g root -m 0440 /dev/stdin "$RULE.new" || return 2
+  visudo -c -f "$RULE.new" >/dev/null 2>&1 || return 1
+}
+root_grant() { # $1 = minutes; prints the end epoch
+  trap '' HUP INT TERM
+  root_lock
+  local min=$1 end unit ts rc=0
+  [[ $min =~ ^[0-9]{1,4}$ ]] && (( 10#$min >= 1 && 10#$min <= MAX_MIN )) || { echo "bad minutes: $min" >&2; return 1; }
+  # The deadline starts now, after sudo authenticated, not when the command was typed.
+  end=$(( $(date +%s) + 10#$min * 60 ))
+  unit="$UNIT-$end-$$"
+  mapfile -t ts < <(root_ts_files)
+  # NOTAFTER makes classic sudo ignore the rule after the deadline even if the
+  # timer is lost. sudo-rs rejects the option, so fall back to the plain rule.
+  # Plain -c -f (no -q): also understood by sudo-rs, Ubuntu's default sudo since 25.10.
+  root_stage "$user ALL=(ALL:ALL) NOTAFTER=$(date -u -d "@$end" '+%Y%m%d%H%M%SZ') NOPASSWD: ALL" || rc=$?
+  if (( rc == 1 )); then
+    rc=0
+    root_stage "$user ALL=(ALL:ALL) NOPASSWD: ALL" || rc=$?
+  fi
+  if (( rc )); then
+    rm -f "$RULE.new"
+    echo "could not write a rule visudo accepts, nothing changed." >&2
+    return 1
+  fi
+  # Order: stage marker, boot cleanup, new timer; then swap marker and rule in
+  # by rename, then the old timers off. Until the swap, a failure leaves the
+  # previous grant as it was, and the new timer is cancelled again.
+  printf '%s\n' "$end" | install -o root -g root -m 0444 /dev/stdin "$MARK.new"
+  printf 'r %s\nr %s\nr %s\n' "$RULE" "$RULE.new" "$MARK" | install -o root -g root -m 0644 /dev/stdin "$CLEANUP"
+  # Wall-clock deadline in UTC, not --on-active: monotonic timers pause during
+  # suspend, and local times are ambiguous at the DST switch. A calendar timer
+  # whose time passed during suspend fires on resume. AccuracySec defaults to 1 min.
+  if ! systemd-run --quiet --collect --unit="$unit" --timer-property=AccuracySec=1s \
+    --on-calendar="$(date -u -d "@$end" '+%Y-%m-%d %H:%M:%S') UTC" \
+    /usr/bin/rm -f "$RULE" "$MARK" "${ts[@]}"; then
+    rm -f "$RULE.new" "$MARK.new"
+    echo "could not start the expiry timer, nothing changed." >&2
+    return 1
+  fi
+  # The timer does not take the lock: if an old one fires during this run, it
+  # can only remove a rule early, which is the safe direction.
+  if ! { mv -f "$MARK.new" "$MARK" && mv -f "$RULE.new" "$RULE"; }; then
+    systemctl stop "$unit.timer" "$unit.service" 2>/dev/null || true
+    rm -f "$RULE.new" "$MARK.new"
+    echo "could not install the rule, previous state kept." >&2
+    return 1
+  fi
+  if ! visudo -c >/dev/null 2>&1; then
+    rm -f "$RULE" "$MARK"
+    root_stop_timers
+    echo "sudoers check failed after install, all sudo-frei rules removed." >&2
+    return 1
+  fi
+  # Old timers go last; we hold the lock, so none of them can have fired meanwhile.
+  root_stop_timers "$unit"
+  echo "$end"
+}
+as_root() { # as_root FUNCTION ARGS...
+  sudo env RULE="$RULE" CLEANUP="$CLEANUP" MARK="$MARK" LOCK="$LOCK" LOCK_WAIT="$LOCK_WAIT" UNIT="$UNIT" TSROOT="$TSROOT" \
+    LEGACY_MARK="$LEGACY_MARK" LEGACY_UNIT="$LEGACY_UNIT" \
+    MAX_MIN="$MAX_MIN" user="$user" uid="$uid" \
+    bash -c "set -euo pipefail; $(declare -f root_lock root_stop_timers root_ts_files root_revoke root_stage root_grant); \"\$@\"" sudo-frei "$@"
+}
+
+case $1 in
+  state)
+    # "on END_EPOCH", "off", or "orphan" (rule without a working timer); needs no sudo.
+    if [[ -e $LEGACY_MARK ]]; then
+      echo "orphan" # left by an older version; revoke cleans it up
+    elif [[ -e $MARK ]]; then
+      read -r end <"$MARK" || end=""
+      [[ $end =~ ^[0-9]+$ ]] || end=0
+      if (( end + 60 >= $(date +%s) )) &&
+        systemctl list-units --plain --no-legend --type=timer --state=active "$UNIT*" | grep -q .; then
+        echo "on $end"
+      else
+        echo "orphan"
+      fi
+    else
+      echo "off"
+    fi
+    ;;
+  revoke)
+    as_root root_revoke || die "revoke failed."
+    sudo -K 2>/dev/null || true
+    echo "$host: off, sudo asks for the password again."
+    ;;
+  grant)
+    end=$(as_root root_grant "$2") || die "not granted."
+    [[ $end =~ ^[0-9]+$ ]] || die "unexpected answer from the root part: $end"
+    # Prove it works without cached credentials: the rule could be valid yet
+    # unused (sudoers.d not included, or overridden by a later rule).
+    if ! sudo -n -k true 2>/dev/null; then
+      as_root root_revoke || true
+      die "rule installed, but sudo still wants a password (is /etc/sudoers.d included?). Removed again."
+    fi
+    echo "$host: on for $user until $(date -d "@$end" '+%H:%M %Z') ($2 min)."
+    ;;
+esac
+EOF
+
+die() { echo "sudo-frei-cli: $*" >&2; exit 1; }
+usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; }
+
+config_hosts() {
+  if [[ -f $CONFIG ]]; then
+    local hosts
+    hosts=$(python3 -I -c 'import sys, tomllib
+h = tomllib.load(open(sys.argv[1], "rb")).get("hosts") or []
+if not isinstance(h, list) or not all(isinstance(x, str) for x in h):
+    sys.exit("hosts must be a list of strings")
+print(*h, sep="\n")' "$CONFIG") ||
+      die "$CONFIG: could not read hosts."
+    if [[ -n ${hosts//[[:space:]]/} ]]; then
+      grep -v '^[[:space:]]*$' <<<"$hosts"
+      return
+    fi
+  fi
+  printf '%s\n' "${FALLBACK_HOSTS[@]}"
+}
+
+is_local() { [[ $1 == local || $1 == "$(uname -n)" ]]; }
+
+# run_on HOST ACTION [MINUTES]; interactive=1 allocates a tty so sudo can ask for the password.
+run_on() {
+  local host=$1 interactive=$2
+  shift 2
+  [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid host name: $host"
+  if is_local "$host"; then
+    bash -c "$REMOTE" sudo-frei "$@"
+    return
+  fi
+  local b64 opts=(-o ConnectTimeout=8)
+  b64=$(base64 -w0 <<<"$REMOTE")
+  if (( interactive )) && [[ -t 0 ]]; then
+    opts+=(-t)
+  else
+    opts+=(-o BatchMode=yes)
+  fi
+  # Arguments are validated words (grant/revoke/state, a number), safe to pass unquoted.
+  # Decode first and stop if that fails: bash -c "" would exit 0 and fake success.
+  ssh "${opts[@]}" "$host" "c=\$(echo $b64 | base64 -d) && [ -n \"\$c\" ] && bash -c \"\$c\" sudo-frei $*"
+}
+
+action=${1:-}
+case $action in
+  grant)
+    host=${2:-} min=${3:-$DEFAULT_MIN}
+    [[ -n $host ]] || die "which host? sudo-frei-cli grant HOST [MINUTES]"
+    # Decimal only (bash reads 010 as octal), and short enough not to overflow.
+    [[ $min =~ ^[0-9]{1,4}$ ]] && (( 10#$min >= 1 && 10#$min <= MAX_MIN )) ||
+      die "minutes must be between 1 and $MAX_MIN."
+    min=$(( 10#$min ))
+    run_on "$host" 1 grant "$min"
+    ;;
+  revoke)
+    host=${2:-}
+    [[ -n $host ]] || die "which host? sudo-frei-cli revoke HOST"
+    run_on "$host" 1 revoke
+    ;;
+  status)
+    shift
+    raw=0
+    [[ ${1:-} == --raw ]] && { raw=1; shift; }
+    hosts=("$@")
+    if (( ! ${#hosts[@]} )); then
+      list=$(config_hosts) || exit 1
+      mapfile -t hosts <<<"$list"
+    fi
+    # All hosts in parallel, each capped at STATUS_TIMEOUT, printed in the given order.
+    out=$(mktemp -d)
+    trap 'rm -rf "$out"' EXIT
+    for i in "${!hosts[@]}"; do
+      (
+        timeout "$STATUS_TIMEOUT" "$0" _state1 "${hosts[$i]}" >"$out/$i" 2>/dev/null ||
+          echo offline >"$out/$i"
+      ) &
+    done
+    wait
+    now=$(date +%s)
+    for i in "${!hosts[@]}"; do
+      h=${hosts[$i]}
+      state=offline end=""
+      read -r state end <"$out/$i" || true
+      # Remote output is untrusted: only known words, and a plain number for
+      # "on" (bash would evaluate e.g. x[$(cmd)] inside $(( ))).
+      case $state in
+        on) [[ $end =~ ^[0-9]+$ ]] || state=offline ;;
+        off | orphan) end="" ;;
+        *) state=offline end="" ;;
+      esac
+      if (( raw )); then
+        printf '%s\t%s\t%s\n' "$h" "$state" "$end"
+      elif [[ $state == on ]]; then
+        echo "$h: on until $(date -d "@$end" +%H:%M) ($(( (end - now + 59) / 60 )) min left)"
+      elif [[ $state == off ]]; then
+        echo "$h: off"
+      elif [[ $state == orphan ]]; then
+        echo "$h: WARNING passwordless sudo without an expiry timer. End it: sudo-frei-cli revoke $h"
+      else
+        echo "$h: unreachable"
+      fi
+    done
+    ;;
+  _remote)
+    # Internal: print the code that runs on the target, for scripts/sudo-frei-test.
+    printf '%s\n' "$REMOTE"
+    ;;
+  _state1)
+    # Internal: one host's state line, run under timeout by `status`.
+    run_on "$2" 0 state
+    ;;
+  -h | --help | help | "") usage ;;
+  *) die "unknown command: $action (grant, revoke, status)" ;;
+esac

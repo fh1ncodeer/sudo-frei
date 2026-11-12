@@ -236,7 +236,9 @@ run_on() {
   fi
   # Arguments are validated words (grant/revoke/state, a number), safe to pass unquoted.
   # Decode first and stop if that fails: bash -c "" would exit 0 and fake success.
-  ssh "${opts[@]}" "$host" "c=\$(echo $b64 | base64 -d) && [ -n \"\$c\" ] && bash -c \"\$c\" sudo-frei $*"
+  # ssh hands the command to the login shell, which may be fish or csh: all they
+  # get to parse is one single-quoted word for bash (base64 has no quotes).
+  ssh "${opts[@]}" "$host" "bash -c 'c=\$(echo $b64 | base64 -d) && [ -n \"\$c\" ] && exec bash -c \"\$c\" sudo-frei $*'"
 }
 
 action=${1:-}

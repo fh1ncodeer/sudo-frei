@@ -49,15 +49,20 @@ exec /usr/bin/date "$@"
 EOF
 cat >"$S/bin/install" <<'EOF'
 #!/bin/bash
-# Like install, minus -o/-g (needs root).
+# Like install, minus -o/-g (needs root), and as picky as uutils install
+# (Ubuntu 25.10+): copying /dev/stdin over an existing file fails.
 args=()
 while (($#)); do case $1 in -o | -g) shift 2 ;; *) args+=("$1"); shift ;; esac; done
+if [[ ${args[-2]} == /dev/stdin && -e ${args[-1]} ]]; then
+  echo "install: cannot overwrite ${args[-1]} from /dev/stdin" >&2
+  exit 1
+fi
 exec /usr/bin/install "${args[@]}"
 EOF
 chmod +x "$S"/bin/*
 
 # --- root functions from the real script --------------------------------------
-funcs=$(bash -c "$("$here/sudo-frei-cli" _remote)"$'\n'"declare -f root_lock root_stop_timers root_ts_files root_revoke root_stage root_grant" sudo-frei _none)
+funcs=$(bash -c "$("$here/sudo-frei-cli" _remote)"$'\n'"declare -f root_lock root_stop_timers root_ts_files root_revoke root_put root_stage root_grant" sudo-frei _none)
 
 root() { # root FUNCTION ARGS... with all paths inside the sandbox
   env SB="$S" PATH="$S/bin:$PATH" FAIL_RUN="${FAIL_RUN:-}" FAIL_NOTAFTER="${FAIL_NOTAFTER:-}" \
@@ -91,12 +96,19 @@ check "grant: timer removes rule and marker" grep -q -- "UTC /usr/bin/rm -f $S/e
 check "grant: lock dir is root-only (0700)" test "$(stat -c %a "$S/run/sudo-frei")" = 700
 check "grant: timer removes the uid timestamp" grep -q -- "$S/run/sudo/ts/1000" "$S/log"
 check "grant: no staged rule or marker left" test ! -e "$R.new" -a ! -e "$M.new"
+check "grant: no temp files left" test -z "$(find "$S/etc" "$S/run" -name '*.tmp')"
 
 # 2. re-grant: new timer replaces the old one
 root root_grant 15 >/dev/null
 check "re-grant: still exactly one timer" test "$(timers)" -eq 1
 check "re-grant: it is the new one" grep -q -- '-2000000600-' "$S/units"
 check "re-grant: marker updated" grep -qx 2000000600 "$M"
+
+# 2b. files left by an interrupted run do not get in the way
+touch "$R.new" "$R.new.tmp" "$M.new" "$M.new.tmp" "$S/etc/tmpfiles.d/sudo-frei.conf.tmp"
+root root_grant 15 >/dev/null
+check "leftovers: grant succeeds, marker correct" grep -qx 2000000600 "$M"
+check "leftovers: none remain" test -z "$(find "$S/etc" "$S/run" -name '*.new' -o -name '*.tmp')"
 
 # 3. re-grant where systemd-run fails: the previous grant stays as it was
 cp "$R" "$S/rule.before"
@@ -140,9 +152,11 @@ check "lock busy: nothing changed" cmp -s "$R" "$S/rule.after-sudo-rs"
 touch "$S/run/sudo-frei-ende"
 
 # 7. revoke
+touch "$R.new.tmp" "$M.new.tmp"
 root root_revoke
 check "revoke: rule gone" test ! -e "$R"
 check "revoke: marker gone" test ! -e "$M"
+check "revoke: no staged or temp files" test -z "$(find "$S/etc/sudoers.d" "$S/run" -name '*.new' -o -name '*.tmp')"
 check "revoke: legacy marker gone" test ! -e "$S/run/sudo-frei-ende"
 check "revoke: no timers" test "$(timers)" -eq 0
 check "revoke: sudo timestamps gone (name and uid)" test ! -e "$S/run/sudo/ts/tester" -a ! -e "$S/run/sudo/ts/1000"

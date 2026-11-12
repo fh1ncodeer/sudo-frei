@@ -85,16 +85,25 @@ root_revoke() {
   trap '' HUP INT TERM
   root_lock
   # Rule first: whatever happens afterwards, nothing passwordless is left.
-  rm -f "$RULE" "$RULE.new" "$MARK" "$MARK.new" "$LEGACY_MARK"
+  rm -f "$RULE" "$RULE.new" "$RULE.new.tmp" "$MARK" "$MARK.new" "$MARK.new.tmp" "$LEGACY_MARK"
   root_stop_timers
   local ts
   mapfile -t ts < <(root_ts_files)
   rm -f "${ts[@]}"
 }
+root_put() { # root_put MODE DEST: stdin -> DEST (root:root, MODE), replacing DEST atomically
+  # Via a temp file and rename, never onto an existing file: uutils install
+  # (Ubuntu 25.10+) fails when copying /dev/stdin over one, and DEST keeps its
+  # old content until the new one is complete. The temp name has a dot and no
+  # .conf ending, so sudo and tmpfiles.d both skip it.
+  rm -f "$2.tmp" && install -o root -g root -m "$1" /dev/stdin "$2.tmp" && mv -f "$2.tmp" "$2" && return 0
+  rm -f "$2.tmp"
+  return 1
+}
 root_stage() { # write rule line $1 to RULE.new (sudo skips names with a dot); 2 = write failed, 1 = rejected
   # Explicit returns: callers use this in a condition, where set -e is off.
   printf '# Written by sudo-frei; removed by %s-*.timer and at boot (%s).\n%s\n' "$UNIT" "$CLEANUP" "$1" |
-    install -o root -g root -m 0440 /dev/stdin "$RULE.new" || return 2
+    root_put 0440 "$RULE.new" || return 2
   visudo -c -f "$RULE.new" >/dev/null 2>&1 || return 1
 }
 root_grant() { # $1 = minutes; prints the end epoch
@@ -122,8 +131,8 @@ root_grant() { # $1 = minutes; prints the end epoch
   # Order: stage marker, boot cleanup, new timer; then swap marker and rule in
   # by rename, then the old timers off. Until the swap, a failure leaves the
   # previous grant as it was, and the new timer is cancelled again.
-  printf '%s\n' "$end" | install -o root -g root -m 0444 /dev/stdin "$MARK.new"
-  printf 'r %s\nr %s\nr %s\n' "$RULE" "$RULE.new" "$MARK" | install -o root -g root -m 0644 /dev/stdin "$CLEANUP"
+  printf '%s\n' "$end" | root_put 0444 "$MARK.new"
+  printf 'r %s\nr %s\nr %s\n' "$RULE" "$RULE.new" "$MARK" | root_put 0644 "$CLEANUP"
   # Wall-clock deadline in UTC, not --on-active: monotonic timers pause during
   # suspend, and local times are ambiguous at the DST switch. A calendar timer
   # whose time passed during suspend fires on resume. AccuracySec defaults to 1 min.
@@ -156,7 +165,7 @@ as_root() { # as_root FUNCTION ARGS...
   sudo env RULE="$RULE" CLEANUP="$CLEANUP" MARK="$MARK" LOCK="$LOCK" LOCK_WAIT="$LOCK_WAIT" UNIT="$UNIT" TSROOT="$TSROOT" \
     LEGACY_MARK="$LEGACY_MARK" LEGACY_UNIT="$LEGACY_UNIT" \
     MAX_MIN="$MAX_MIN" user="$user" uid="$uid" \
-    bash -c "set -euo pipefail; $(declare -f root_lock root_stop_timers root_ts_files root_revoke root_stage root_grant); \"\$@\"" sudo-frei "$@"
+    bash -c "set -euo pipefail; $(declare -f root_lock root_stop_timers root_ts_files root_revoke root_put root_stage root_grant); \"\$@\"" sudo-frei "$@"
 }
 
 case $1 in

@@ -48,9 +48,9 @@ During a grant the user is effectively root, without being asked. That applies t
 ## Requirements
 
 - **Controlling machine:** bash, ssh, python3 ≥ 3.11 (for `tomllib`); Rust ≥ 1.88 for the TUI.
-- **Targets:** Linux with systemd, sudo and `flock` (util-linux), SSH login as a regular user with sudo rights and a plain lowercase user name.
+- **Targets:** Linux with systemd, sudo, bash and `flock` (util-linux), SSH login as a regular user with sudo rights and a plain lowercase user name. The login shell does not have to be bash; fish and others work, since all they get to parse is one quoted word.
 - **Tested on real hosts:** grant, timed expiry, early revoke and the NOTAFTER rule on Arch (systemd 262, sudo 1.9.17p2); grant and timed expiry on Debian 13 (systemd 257, sudo 1.9.16p2).
-- **Ubuntu 25.10+ with `sudo-rs`:** intended, but untested.
+- **Ubuntu 25.10+ with `sudo-rs` and uutils coreutils:** handled in the code (the rule goes without `NOTAFTER`; files are written via a temp file, as uutils `install` does not overwrite from stdin), but not yet tested on a real host.
 - **Raspberry Pi OS:** ships `/etc/sudoers.d/010_pi-nopasswd`, so sudo is already passwordless for good there. sudo-frei only makes sense once that file is removed.
 
 ## Install
@@ -81,7 +81,7 @@ cp config.example.toml ~/.config/sudo-frei/config.toml   # add your hosts
 | u | refresh |
 | q | quit |
 
-The **SSH key** column shows per host whether the key from `ssh -G HOST` is loaded in the agent. For password and passphrase prompts the TUI hands the terminal to `sudo-frei-cli` or `ssh-add`. All sudo logic lives in `sudo-frei-cli`; the TUI only calls it.
+The **SSH key** column shows per host whether the key from `ssh -G HOST` is loaded in the agent. For password and passphrase prompts the TUI hands the terminal to `sudo-frei-cli` or `ssh-add`. **R** is the exception: `revoke --all` runs in the background and never asks for anything, so a host whose key is not loaded counts as unreachable and is named in the message. All sudo logic lives in `sudo-frei-cli`; the TUI only calls it.
 
 ## Tests
 

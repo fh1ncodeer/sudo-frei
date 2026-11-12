@@ -4,6 +4,7 @@
 #
 #   sudo-frei-cli grant HOST [MINUTES]   enable for MINUTES (default 30, max 240); asks for HOST's sudo password once
 #   sudo-frei-cli revoke HOST            end early
+#   sudo-frei-cli revoke --all           end early on every host that answers; never asks for a password
 #   sudo-frei-cli status [--raw] [HOST...]  show state (default: hosts from the config)
 #
 # HOST is an ssh name (e.g. Tailscale MagicDNS or ~/.ssh/config); "local" or this machine's
@@ -37,6 +38,7 @@ MAX_MIN=240
 # Seconds per host in `status`; the config can override both.
 STATUS_TIMEOUT=2.3
 STATUS_TIMEOUT_PROXY=8 # hosts behind ProxyJump/ProxyCommand: two ssh handshakes
+REVOKE_ALL_TIMEOUT=30  # seconds per host in `revoke --all`
 
 # Runs on the target host as the login user: bash -c "$REMOTE" sudo-frei ACTION [MINUTES]
 read -r -d '' REMOTE <<'EOF' || true
@@ -175,6 +177,10 @@ as_root() { # as_root FUNCTION ARGS...
     MAX_MIN="$MAX_MIN" user="$user" uid="$uid" \
     bash -c "set -euo pipefail; $(declare -f root_lock root_stop_timers root_ts_files root_revoke root_put root_stage root_grant); \"\$@\"" sudo-frei "$@"
 }
+revoke_now() {
+  as_root root_revoke || die "revoke failed."
+  sudo -K 2>/dev/null || true
+}
 
 case $1 in
   state)
@@ -195,9 +201,20 @@ case $1 in
     fi
     ;;
   revoke)
-    as_root root_revoke || die "revoke failed."
-    sudo -K 2>/dev/null || true
+    revoke_now
     echo "$host: off, sudo asks for the password again."
+    ;;
+  revoke-batch)
+    # For `revoke --all`, which has no terminal: act only where sudo needs no
+    # password right now. Prints "revoked" or "off".
+    if sudo -n true 2>/dev/null; then
+      revoke_now
+      echo revoked
+    elif [[ -e $MARK || -e $LEGACY_MARK ]]; then
+      die "a grant is marked, but sudo wants a password; revoke this host on its own."
+    else
+      echo off
+    fi
     ;;
   grant)
     end=$(as_root root_grant "$2") || die "not granted."
@@ -214,7 +231,7 @@ esac
 EOF
 
 die() { echo "sudo-frei-cli: $*" >&2; exit 1; }
-usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # read_config: take the hosts and the status timeouts from $CONFIG, if it exists.
 CONFIG_HOSTS=()
@@ -270,11 +287,38 @@ run_on() {
   else
     opts+=(-o BatchMode=yes)
   fi
-  # Arguments are validated words (grant/revoke/state, a number), safe to pass unquoted.
+  # Arguments are validated words (an action, a number), safe to pass unquoted.
   # Decode first and stop if that fails: bash -c "" would exit 0 and fake success.
   # ssh hands the command to the login shell, which may be fish or csh: all they
   # get to parse is one single-quoted word for bash (base64 has no quotes).
   ssh "${opts[@]}" "$host" "bash -c 'c=\$(echo $b64 | base64 -d) && [ -n \"\$c\" ] && exec bash -c \"\$c\" sudo-frei $*'"
+}
+
+# fan_out ACTION HOST...: run ACTION (state or revoke-batch) on all hosts at once,
+# without a terminal, each under its own timeout. Leaves the Nth host's stdout
+# in $out/N and its exit code in $out/N.rc (124 = timeout, 255 = ssh failed).
+fan_out() {
+  local act=$1 i
+  shift
+  out=$(mktemp -d)
+  trap 'rm -rf "$out"' EXIT
+  for i in $(seq 0 $(( $# - 1 ))); do
+    (
+      host=${@:i+1:1} rc=0
+      if [[ $act == state ]]; then secs=$(host_timeout "$host"); else secs=$REVOKE_ALL_TIMEOUT; fi
+      timeout "$secs" "$0" _on "$host" "$act" >"$out/$i" 2>"$out/$i.err" || rc=$?
+      echo "$rc" >"$out/$i.rc"
+    ) &
+  done
+  wait
+}
+
+# The hosts to act on: the given ones, else the config's, else this machine.
+pick_hosts() {
+  read_config
+  hosts=("$@")
+  (( ${#hosts[@]} )) || hosts=("${CONFIG_HOSTS[@]}")
+  (( ${#hosts[@]} )) || hosts=("${FALLBACK_HOSTS[@]}")
 }
 
 action=${1:-}
@@ -290,32 +334,47 @@ case $action in
     ;;
   revoke)
     host=${2:-}
-    [[ -n $host ]] || die "which host? sudo-frei-cli revoke HOST"
-    run_on "$host" 1 revoke
+    [[ -n $host ]] || die "which host? sudo-frei-cli revoke HOST, or revoke --all"
+    if [[ $host != --all ]]; then
+      run_on "$host" 1 revoke
+      exit
+    fi
+    # Every host from the config at once. Without a terminal nothing can ask for
+    # a password: a host that still wants one for sudo has nothing to revoke.
+    pick_hosts
+    fan_out revoke-batch "${hosts[@]}"
+    failed=0
+    for i in "${!hosts[@]}"; do
+      h=${hosts[$i]}
+      case $(<"$out/$i.rc") in
+        0)
+          # Remote output is untrusted: only the two known words.
+          case $(<"$out/$i") in
+            revoked) echo "$h: revoked." ;;
+            off) echo "$h: was off." ;;
+            *) echo "$h: FAILED, unexpected answer." >&2; failed=1 ;;
+          esac
+          ;;
+        124 | 255) echo "$h: unreachable" ;;
+        *)
+          echo "$h: FAILED. $(tail -n 1 "$out/$i.err" | tr -d '\000-\037\177')" >&2
+          failed=1
+          ;;
+      esac
+    done
+    exit "$failed"
     ;;
   status)
     shift
     raw=0
     [[ ${1:-} == --raw ]] && { raw=1; shift; }
-    read_config
-    hosts=("$@")
-    (( ${#hosts[@]} )) || hosts=("${CONFIG_HOSTS[@]}")
-    (( ${#hosts[@]} )) || hosts=("${FALLBACK_HOSTS[@]}")
-    # All hosts in parallel, each capped at its timeout, printed in the given order.
-    out=$(mktemp -d)
-    trap 'rm -rf "$out"' EXIT
-    for i in "${!hosts[@]}"; do
-      (
-        timeout "$(host_timeout "${hosts[$i]}")" "$0" _state1 "${hosts[$i]}" >"$out/$i" 2>/dev/null ||
-          echo offline >"$out/$i"
-      ) &
-    done
-    wait
+    pick_hosts "$@"
+    fan_out state "${hosts[@]}"
     now=$(date +%s)
     for i in "${!hosts[@]}"; do
       h=${hosts[$i]}
       state=offline end=""
-      read -r state end <"$out/$i" || true
+      [[ $(<"$out/$i.rc") != 0 ]] || read -r state end <"$out/$i" || true
       # Remote output is untrusted: only known words, and a plain number for
       # "on" (bash would evaluate e.g. x[$(cmd)] inside $(( ))).
       case $state in
@@ -340,9 +399,10 @@ case $action in
     # Internal: print the code that runs on the target, for scripts/sudo-frei-test.
     printf '%s\n' "$REMOTE"
     ;;
-  _state1)
-    # Internal: one host's state line, run under timeout by `status`.
-    run_on "$2" 0 state
+  _on)
+    # Internal: _on HOST ACTION, one host without a terminal, run under timeout by fan_out.
+    [[ ${3:-} == state || ${3:-} == revoke-batch ]] || die "unknown command: $action"
+    run_on "$2" 0 "$3"
     ;;
   -h | --help | help | "") usage ;;
   *) die "unknown command: $action (grant, revoke, status)" ;;

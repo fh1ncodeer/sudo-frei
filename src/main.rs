@@ -3,6 +3,7 @@
 //! The bash script stays the only thing that touches hosts; this UI shows
 //! `sudo-frei-cli status --raw` and runs `sudo-frei-cli grant|revoke` with the real
 //! terminal handed over, so sudo can ask for a password the usual way.
+//! `revoke --all` never asks for one and runs in the background.
 //! It also shows the SSH agent: which keys in ~/.ssh are loaded and whether
 //! each host's key (from `ssh -G`) is, since grant/revoke need it.
 
@@ -300,19 +301,29 @@ enum Mode {
 
 type StatusResult = Result<Vec<(String, State)>, String>;
 
+/// What a background run of the script reports back.
+enum Done {
+    Status(StatusResult),
+    /// `revoke --all`; the error is what the script said about failed hosts.
+    RevokedAll(Result<(), String>),
+}
+
 struct App {
     cfg: Config,
     rows: Vec<HostRow>,
     table: TableState,
     mode: Mode,
     refreshing: bool,
+    /// Something changed while a refresh was running: its answer may be stale.
+    refresh_again: bool,
+    revoking_all: bool,
     last_refresh: Option<Instant>,
     agent: AgentState,
     agent_read: Instant,
     key_files: Vec<KeyFile>,
     message: Option<(String, Instant)>,
-    tx: Sender<StatusResult>,
-    rx: Receiver<StatusResult>,
+    tx: Sender<Done>,
+    rx: Receiver<Done>,
     quit: bool,
 }
 
@@ -336,6 +347,8 @@ impl App {
             table,
             mode: Mode::Normal,
             refreshing: false,
+            refresh_again: false,
+            revoking_all: false,
             last_refresh: None,
             agent: read_agent(),
             agent_read: Instant::now(),
@@ -361,6 +374,7 @@ impl App {
 
     fn refresh(&mut self) {
         if self.refreshing {
+            self.refresh_again = true;
             return;
         }
         self.refreshing = true;
@@ -382,43 +396,85 @@ impl App {
                         Err(String::from_utf8_lossy(&o.stderr).trim().to_string())
                     }
                 });
-            let _ = tx.send(result);
+            let _ = tx.send(Done::Status(result));
+        });
+    }
+
+    /// End every grant. The script asks no host for a password, so this needs no terminal.
+    fn revoke_all(&mut self) {
+        if self.revoking_all {
+            return;
+        }
+        self.revoking_all = true;
+        let tx = self.tx.clone();
+        let script = self.cfg.script.clone();
+        thread::spawn(move || {
+            let result = Command::new(&script)
+                .args(["revoke", "--all"])
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| format!("{script}: {e}"))
+                .and_then(|o| {
+                    if o.status.success() {
+                        Ok(())
+                    } else {
+                        Err(String::from_utf8_lossy(&o.stderr).split_whitespace().collect::<Vec<_>>().join(" "))
+                    }
+                });
+            let _ = tx.send(Done::RevokedAll(result));
         });
     }
 
     fn take_results(&mut self) {
-        while let Ok(result) = self.rx.try_recv() {
-            self.refreshing = false;
-            self.last_refresh = Some(Instant::now());
-            match result {
-                Ok(list) => {
-                    if self.cfg.hosts.is_empty() {
-                        // No config: the script decided the hosts.
-                        // Reuse each host's `ssh -G` result; only new names are read.
-                        let mut old = std::mem::take(&mut self.rows);
-                        self.rows = list
-                            .into_iter()
-                            .map(|(name, state)| {
-                                let keys = match old.iter().position(|r| r.name == name) {
-                                    Some(i) => old.swap_remove(i).keys,
-                                    None => read_host_keys(&name),
-                                };
-                                HostRow { name, state, keys }
-                            })
-                            .collect();
-                    } else {
-                        for (name, state) in list {
-                            if let Some(r) = self.rows.iter_mut().find(|r| r.name == name) {
-                                r.state = state;
-                            }
-                        }
+        while let Ok(done) = self.rx.try_recv() {
+            match done {
+                Done::Status(result) => {
+                    self.refreshing = false;
+                    self.last_refresh = Some(Instant::now());
+                    match result {
+                        Ok(list) => self.set_states(list),
+                        Err(e) => self.flash(format!("status failed: {e}")),
                     }
-                    if self.table.selected().unwrap_or(0) >= self.rows.len() {
-                        self.table.select(Some(0));
+                    if std::mem::take(&mut self.refresh_again) {
+                        self.refresh();
                     }
                 }
-                Err(e) => self.flash(format!("status failed: {e}")),
+                Done::RevokedAll(result) => {
+                    self.revoking_all = false;
+                    self.flash(match result {
+                        Ok(()) => "revoked on every host that answered.".into(),
+                        Err(e) => format!("revoke all: {e}"),
+                    });
+                    self.refresh();
+                }
             }
+        }
+    }
+
+    fn set_states(&mut self, list: Vec<(String, State)>) {
+        if self.cfg.hosts.is_empty() {
+            // No config: the script decided the hosts.
+            // Reuse each host's `ssh -G` result; only new names are read.
+            let mut old = std::mem::take(&mut self.rows);
+            self.rows = list
+                .into_iter()
+                .map(|(name, state)| {
+                    let keys = match old.iter().position(|r| r.name == name) {
+                        Some(i) => old.swap_remove(i).keys,
+                        None => read_host_keys(&name),
+                    };
+                    HostRow { name, state, keys }
+                })
+                .collect();
+        } else {
+            for (name, state) in list {
+                if let Some(r) = self.rows.iter_mut().find(|r| r.name == name) {
+                    r.state = state;
+                }
+            }
+        }
+        if self.table.selected().unwrap_or(0) >= self.rows.len() {
+            self.table.select(Some(0));
         }
     }
 
@@ -548,6 +604,7 @@ fn handle_key(app: &mut App, terminal: &mut DefaultTerminal, code: KeyCode, mods
                 }
                 app.refresh();
             }
+            KeyCode::Char('R') => app.revoke_all(),
             KeyCode::Char('a') => {
                 if matches!(app.agent, AgentState::NoAgent) {
                     app.flash("no SSH agent reachable (SSH_AUTH_SOCK).".into());
@@ -657,7 +714,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    let status = if app.refreshing {
+    let status = if app.revoking_all {
+        "revoking everywhere …".to_string()
+    } else if app.refreshing {
         "checking …".to_string()
     } else {
         match app.last_refresh {
@@ -715,13 +774,15 @@ fn draw(frame: &mut Frame, app: &mut App) {
     .header(Row::new(["host", "sudo", "until", "left", "SSH key"]).style(Style::new().dim()))
     .row_highlight_style(Style::new().reversed())
     .highlight_symbol("› ")
-    .block(Block::bordered());
+    .block(Block::bordered().title_bottom(Line::from(" g grant  r revoke  R revoke all ").dim()));
     frame.render_stateful_widget(table, body, &mut app.table);
 
-    frame.render_widget(Paragraph::new(agent_lines).block(Block::bordered().title(" SSH-Agent ")), agent);
+    // Each box names the keys that act on it; the last line keeps the rest.
+    let agent_box = Block::bordered().title(" SSH-Agent ").title_bottom(Line::from(" a add key  x clear agent ").dim());
+    frame.render_widget(Paragraph::new(agent_lines).block(agent_box), agent);
 
     let keys = match app.mode {
-        Mode::Normal => " ↑↓ select  g grant  r revoke  a add key  x clear agent  u refresh  q quit",
+        Mode::Normal => " ↑↓ select  u refresh  q quit",
         Mode::Grant { .. } => " type minutes  ←→ presets  Enter grant  Esc cancel",
         Mode::AddKey { .. } => " digit picks the key  Esc cancel",
     };

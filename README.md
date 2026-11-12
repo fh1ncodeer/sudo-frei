@@ -11,6 +11,7 @@ sudo-frei                         # the TUI
 sudo-frei-cli grant server 30     # 30 minutes of passwordless sudo on "server"
 sudo-frei-cli status              # all hosts from the config
 sudo-frei-cli revoke server       # end it early
+sudo-frei-cli revoke --all        # end it early everywhere
 ```
 
 ## How it works
@@ -35,6 +36,7 @@ The deadline is computed after sudo has accepted the password, so slow typing do
 | The switch itself fails halfway | everything is removed (fail-safe: off) |
 | The final `visudo -c` fails | everything is removed (fail-safe: off) |
 | `revoke` | deletes the rule first, then the timers |
+| `revoke --all` | every host from the config at once, without a terminal: it never asks for a password. A host that is unreachable is reported and skipped; so is one where sudo already wants a password, as there is nothing to revoke |
 | Rule without a timer, or past its deadline | `status` reports **orphan** instead of "off" |
 | Clock set back by root or NTP | the timer fires later by that much; with classic sudo `NOTAFTER` follows the same clock |
 
@@ -72,6 +74,7 @@ cp config.example.toml ~/.config/sudo-frei/config.toml   # add your hosts
 | ↑↓ | select host |
 | g | grant (type minutes or ←→ for presets) |
 | r | revoke |
+| R | revoke on all hosts |
 | a | add an SSH key (`ssh-add`) |
 | x | clear the agent |
 | u | refresh |

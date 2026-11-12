@@ -304,7 +304,7 @@ type StatusResult = Result<Vec<(String, State)>, String>;
 /// What a background run of the script reports back.
 enum Done {
     Status(StatusResult),
-    /// `revoke --all`; the error is what the script said about failed hosts.
+    /// `revoke --all`; the error is what the script said about hosts that failed or did not answer.
     RevokedAll(Result<(), String>),
 }
 
@@ -418,7 +418,7 @@ impl App {
                     if o.status.success() {
                         Ok(())
                     } else {
-                        Err(String::from_utf8_lossy(&o.stderr).split_whitespace().collect::<Vec<_>>().join(" "))
+                        Err(String::from_utf8_lossy(&o.stderr).lines().map(str::trim).collect::<Vec<_>>().join(", "))
                     }
                 });
             let _ = tx.send(Done::RevokedAll(result));
@@ -431,18 +431,20 @@ impl App {
                 Done::Status(result) => {
                     self.refreshing = false;
                     self.last_refresh = Some(Instant::now());
+                    if std::mem::take(&mut self.refresh_again) {
+                        // Asked before the change: do not show it, ask again.
+                        self.refresh();
+                        continue;
+                    }
                     match result {
                         Ok(list) => self.set_states(list),
                         Err(e) => self.flash(format!("status failed: {e}")),
-                    }
-                    if std::mem::take(&mut self.refresh_again) {
-                        self.refresh();
                     }
                 }
                 Done::RevokedAll(result) => {
                     self.revoking_all = false;
                     self.flash(match result {
-                        Ok(()) => "revoked on every host that answered.".into(),
+                        Ok(()) => "revoked everywhere.".into(),
                         Err(e) => format!("revoke all: {e}"),
                     });
                     self.refresh();
@@ -490,7 +492,8 @@ impl App {
         // A grant that just ran out: check right away instead of waiting.
         let expired = self.rows.iter().any(|r| matches!(r.state, State::On(end) if end <= now_epoch()))
             && self.last_refresh.is_some_and(|t| t.elapsed() > Duration::from_secs(3));
-        if due || expired {
+        // Not while one is running: refresh() would take that as "something changed".
+        if (due || expired) && !self.refreshing {
             self.refresh();
         }
         if self.message.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(6)) {

@@ -742,7 +742,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
                     fmt_left(end - now),
                     Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
-                State::Off => ("off", String::new(), String::new(), Style::new().fg(Color::Green)),
+                // The normal state stays quiet; colour is for what needs a look.
+                State::Off => ("off", String::new(), String::new(), Style::new().add_modifier(Modifier::DIM)),
                 State::Orphan => (
                     "orphan",
                     String::new(),
@@ -755,7 +756,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             let key = match key_ready(&r.name, &r.keys, &app.key_files, &loaded) {
                 KeyReady::Local => Cell::from("local").dim(),
                 KeyReady::Loaded(name) => Cell::from(format!("✓ {name}")).green(),
-                KeyReady::Maybe => Cell::from("? Agent").yellow(),
+                KeyReady::Maybe => Cell::from("? agent").yellow(),
                 KeyReady::Missing => Cell::from("✗ missing").red(),
             };
             Row::new(vec![Cell::from(r.name.clone()), Cell::from(state).style(style), Cell::from(until), Cell::from(left), key])
@@ -778,7 +779,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(table, body, &mut app.table);
 
     // Each box names the keys that act on it; the last line keeps the rest.
-    let agent_box = Block::bordered().title(" SSH-Agent ").title_bottom(Line::from(" a add key  x clear agent ").dim());
+    let agent_box = Block::bordered().title(" SSH agent ").title_bottom(Line::from(" a add key  x clear agent ").dim());
     frame.render_widget(Paragraph::new(agent_lines).block(agent_box), agent);
 
     let keys = match app.mode {

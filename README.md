@@ -32,11 +32,12 @@ The deadline is computed after sudo has accepted the password, so slow typing do
 | Suspended past the expiry time | deleted on wake-up |
 | Reboot | deleted at boot |
 | Connection drops, Ctrl-C | the root part ignores HUP/INT/TERM and runs to the end |
-| A re-grant fails before the switch | the previous grant stays, timer included; the new timer is cancelled |
+| A re-grant fails before the switch | the previous grant stays, timer included |
 | The switch itself fails halfway | everything is removed (fail-safe: off) |
 | The final `visudo -c` fails | everything is removed (fail-safe: off) |
+| The rule cannot be removed | the marker and the timers stay, so `status` keeps showing the grant |
 | `revoke` | deletes the rule first, then the timers |
-| `revoke --all` | every host from the config at once, without a terminal: it never asks for a password. A host that is unreachable is reported and skipped; so is one where sudo already wants a password, as there is nothing to revoke |
+| `revoke --all` | every host from the config at once, without a terminal: it never asks for a password. Where sudo already wants one and no grant is marked, there is nothing to do. Exit 1 if a host failed (also: a grant is marked but sudo wants a password, or sudo is still passwordless afterwards). Exit 2 if a host did not answer; that includes a key that is not loaded, and a grant there may still be on |
 | Rule without a timer, or past its deadline | `status` reports **orphan** instead of "off" |
 | Clock set back by root or NTP | the timer fires later by that much; with classic sudo `NOTAFTER` follows the same clock |
 

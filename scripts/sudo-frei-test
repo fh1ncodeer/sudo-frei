@@ -4,7 +4,7 @@
 #
 # The root functions are taken from `sudo-frei-cli _remote` and run as the normal
 # user against a fresh `mktemp -d` sandbox: RULE, MARK, CLEANUP and TSROOT point
-# into it, and systemctl, systemd-run, visudo, install, mv and date are replaced by small
+# into it, and systemctl, systemd-run, visudo, install, mv, rm and date are replaced by small
 # fakes in the sandbox's bin/ that only record calls and write inside the sandbox.
 # Nothing outside the sandbox is written; the sandbox is left in place for inspection.
 set -euo pipefail
@@ -38,6 +38,8 @@ cat >"$S/bin/visudo" <<'EOF'
 #!/bin/bash
 # FAIL_NOTAFTER=1 acts like sudo-rs, which rejects the NOTAFTER option.
 echo "visudo $*" >>"$SB/log"
+# FAIL_CHECK=1: the check of the whole configuration after the swap fails.
+if [[ -n ${FAIL_CHECK:-} && $* == -c ]]; then exit 1; fi
 if [[ -n ${FAIL_NOTAFTER:-} && $1 == -c && ${2:-} == -f ]] && grep -q NOTAFTER "$3"; then exit 1; fi
 exit 0
 EOF
@@ -68,13 +70,30 @@ if [[ -n ${FAIL_MV:-} && ${!#} == */"$FAIL_MV" ]]; then
 fi
 exec /usr/bin/mv "$@"
 EOF
+cat >"$S/bin/rm" <<'EOF'
+#!/bin/bash
+# FAIL_RM=NAME: a file called NAME cannot be removed; like the real rm, the
+# others still are.
+rc=0 args=()
+for a in "$@"; do
+  if [[ -n ${FAIL_RM:-} && $a == */"$FAIL_RM" ]]; then
+    echo "rm: cannot remove $a" >&2
+    rc=1
+  else
+    args+=("$a")
+  fi
+done
+/usr/bin/rm "${args[@]}" || rc=1
+exit "$rc"
+EOF
 chmod +x "$S"/bin/*
 
 # --- root functions from the real script --------------------------------------
-funcs=$(bash -c "$("$here/sudo-frei-cli" _remote)"$'\n'"declare -f root_lock root_stop_timers root_ts_files root_revoke root_put root_stage root_grant" sudo-frei _none)
+funcs=$(bash -c "$("$here/sudo-frei-cli" _remote)"$'\n'"declare -f root_lock root_stop_timers root_ts_files root_clear root_revoke root_put root_stage root_grant" sudo-frei _none)
 
 root() { # root FUNCTION ARGS... with all paths inside the sandbox
   env SB="$S" PATH="$S/bin:$PATH" FAIL_RUN="${FAIL_RUN:-}" FAIL_NOTAFTER="${FAIL_NOTAFTER:-}" FAIL_MV="${FAIL_MV:-}" \
+    FAIL_RM="${FAIL_RM:-}" FAIL_CHECK="${FAIL_CHECK:-}" \
     FAKE_NOW="${FAKE_NOW:-1999999700}" LOCK="$S/run/sudo-frei/lock" LOCK_WAIT="${LOCK_WAIT:-60}" MAX_MIN=240 \
     LEGACY_MARK="$S/run/sudo-frei-ende" LEGACY_UNIT=sudo-frei-ende \
     RULE="$S/etc/sudoers.d/zz-sudo-frei" CLEANUP="$S/etc/tmpfiles.d/sudo-frei.conf" \
@@ -107,17 +126,13 @@ check "grant: timer removes the uid timestamp" grep -q -- "$S/run/sudo/ts/1000" 
 check "grant: no staged rule or marker left" test ! -e "$R.new" -a ! -e "$M.new"
 check "grant: no temp files left" test -z "$(find "$S/etc" "$S/run" -name '*.tmp')"
 
-# 2. re-grant: new timer replaces the old one
+# 2. re-grant: new timer replaces the old one, files left by an interrupted run do not get in the way
+touch "$R.new" "$R.new.tmp" "$M.new" "$M.new.tmp" "$S/etc/tmpfiles.d/sudo-frei.conf.tmp"
 root root_grant 15 >/dev/null
 check "re-grant: still exactly one timer" test "$(timers)" -eq 1
 check "re-grant: it is the new one" grep -q -- '-2000000600-' "$S/units"
 check "re-grant: marker updated" grep -qx 2000000600 "$M"
-
-# 2b. files left by an interrupted run do not get in the way
-touch "$R.new" "$R.new.tmp" "$M.new" "$M.new.tmp" "$S/etc/tmpfiles.d/sudo-frei.conf.tmp"
-root root_grant 15 >/dev/null
-check "leftovers: grant succeeds, marker correct" grep -qx 2000000600 "$M"
-check "leftovers: none remain" test -z "$(find "$S/etc" "$S/run" -name '*.new' -o -name '*.tmp')"
+check "re-grant: no leftovers remain" test -z "$(find "$S/etc" "$S/run" -name '*.new' -o -name '*.tmp')"
 
 # 3. re-grant where systemd-run fails: the previous grant stays as it was
 cp "$R" "$S/rule.before"
@@ -173,12 +188,30 @@ check "lock busy: nothing changed" cmp -s "$R" "$S/rule.after-sudo-rs"
 # 6b. a marker from the pre-rename version is cleaned up by revoke
 touch "$S/run/sudo-frei-ende"
 
+# 6c. the final check of all sudoers files fails: everything is removed
+if FAIL_CHECK=1 root root_grant 5 >/dev/null 2>&1; then rc=0; else rc=$?; fi
+check "failed final check: reports failure" test "$rc" -ne 0
+check "failed final check: rule and marker gone" test ! -e "$R" -a ! -e "$M"
+check "failed final check: no timers" test "$(timers)" -eq 0
+root root_grant 5 >/dev/null
+
+# 6d. the rule cannot be removed: the marker and the timer stay, so status
+# keeps showing the grant and the timer can still end it
+if FAIL_RM=zz-sudo-frei root root_revoke >/dev/null 2>&1; then rc=0; else rc=$?; fi
+check "stuck rule, revoke: reports failure" test "$rc" -ne 0
+check "stuck rule, revoke: marker kept" test -e "$R" -a -e "$M"
+check "stuck rule, revoke: timer kept" test "$(timers)" -eq 1
+if FAIL_MV=zz-sudo-frei FAIL_RM=zz-sudo-frei root root_grant 30 >/dev/null 2>&1; then rc=0; else rc=$?; fi
+check "stuck rule, failed swap: reports failure" test "$rc" -ne 0
+check "stuck rule, failed swap: marker kept" test -e "$R" -a -e "$M"
+check "stuck rule, failed swap: timers kept" test "$(timers)" -ge 1
+
 # 7. revoke
-touch "$R.new.tmp" "$M.new.tmp"
+touch "$R.new.tmp" "$M.new.tmp" "$S/etc/tmpfiles.d/sudo-frei.conf.tmp"
 root root_revoke
 check "revoke: rule gone" test ! -e "$R"
 check "revoke: marker gone" test ! -e "$M"
-check "revoke: no staged or temp files" test -z "$(find "$S/etc/sudoers.d" "$S/run" -name '*.new' -o -name '*.tmp')"
+check "revoke: no staged or temp files" test -z "$(find "$S/etc" "$S/run" -name '*.new' -o -name '*.tmp')"
 check "revoke: legacy marker gone" test ! -e "$S/run/sudo-frei-ende"
 check "revoke: no timers" test "$(timers)" -eq 0
 check "revoke: sudo timestamps gone (name and uid)" test ! -e "$S/run/sudo/ts/tester" -a ! -e "$S/run/sudo/ts/1000"

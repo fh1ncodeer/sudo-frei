@@ -32,6 +32,7 @@ The deadline is computed after sudo has accepted the password, so slow typing do
 | Reboot | deleted at boot |
 | Connection drops, Ctrl-C | the root part ignores HUP/INT/TERM and runs to the end |
 | A re-grant fails before the switch | the previous grant stays, timer included; the new timer is cancelled |
+| The switch itself fails halfway | everything is removed (fail-safe: off) |
 | The final `visudo -c` fails | everything is removed (fail-safe: off) |
 | `revoke` | deletes the rule first, then the timers |
 | Rule without a timer, or past its deadline | `status` reports **orphan** instead of "off" |

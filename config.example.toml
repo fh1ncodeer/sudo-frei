@@ -6,6 +6,12 @@
 # Targets: Linux with systemd and sudo (Arch, Debian, Ubuntu, Raspberry Pi OS).
 hosts = ["local", "laptop", "server", "pi"]
 
+# Seconds `sudo-frei-cli status` waits per host (all hosts are asked at once),
+# 0.1 to 60. Hosts that ssh reaches through a ProxyJump or ProxyCommand need
+# two handshakes and get the second, longer one.
+# status_timeout = 2.3
+# status_timeout_proxy = 8
+
 # The rest is only read by the TUI.
 # Suggestions in the grant dialog (left/right), in minutes, at most 240.
 presets = [5, 15, 30, 60]

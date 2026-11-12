@@ -54,6 +54,10 @@ struct Config {
     /// Path or name of the sudo-frei script.
     #[serde(default = "default_script")]
     script: String,
+    /// Used by the script, not the TUI; listed so the shared file is accepted
+    /// and a bad value is reported here too.
+    status_timeout: Option<f64>,
+    status_timeout_proxy: Option<f64>,
 }
 
 fn default_presets() -> Vec<u32> {
@@ -77,6 +81,8 @@ impl Default for Config {
             default_minutes: default_minutes(),
             refresh_seconds: default_refresh(),
             script: default_script(),
+            status_timeout: None,
+            status_timeout_proxy: None,
         }
     }
 }
@@ -105,6 +111,11 @@ fn load_config() -> Result<Config, String> {
     }
     if cfg.refresh_seconds == 0 {
         return Err(format!("{}: refresh_seconds must be at least 1", path.display()));
+    }
+    for (key, value) in [("status_timeout", cfg.status_timeout), ("status_timeout_proxy", cfg.status_timeout_proxy)] {
+        if value.is_some_and(|t| !(0.1..=60.0).contains(&t)) {
+            return Err(format!("{}: {key} must be between 0.1 and 60", path.display()));
+        }
     }
     if cfg.default_minutes == 0 || cfg.default_minutes > MAX_MIN {
         return Err(format!("{}: default_minutes must be between 1 and {MAX_MIN}", path.display()));
@@ -829,7 +840,8 @@ fn main() {
     if env::args().any(|a| a == "-h" || a == "--help") {
         println!(
             "sudo-frei: time-limited passwordless sudo, the TUI for sudo-frei-cli.\n\
-             config: {} (hosts, presets, default_minutes, refresh_seconds, script)",
+             config: {} (hosts, presets, default_minutes, refresh_seconds, script,\n\
+             status_timeout, status_timeout_proxy)",
             config_path().display()
         );
         return;
@@ -894,6 +906,14 @@ mod tests {
         assert_eq!(key_ready("server", &strict, std::slice::from_ref(&file), &other), KeyReady::Missing);
         assert_eq!(key_ready("server", &loose, std::slice::from_ref(&file), &other), KeyReady::Maybe);
         assert_eq!(key_ready("local", &strict, std::slice::from_ref(&file), &none), KeyReady::Local);
+    }
+
+    #[test]
+    fn config_accepts_the_scripts_timeouts() {
+        // Whole and fractional seconds, as the script accepts them.
+        let cfg: Config = toml::from_str("status_timeout = 2.5\nstatus_timeout_proxy = 8\n").unwrap();
+        assert_eq!((cfg.status_timeout, cfg.status_timeout_proxy), (Some(2.5), Some(8.0)));
+        assert!(toml::from_str::<Config>("status_timeout_typo = 1\n").is_err());
     }
 
     #[test]

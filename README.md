@@ -60,7 +60,9 @@ cp config.example.toml ~/.config/sudo-frei/config.toml   # add your hosts
 
 ## Configuration
 
-`~/.config/sudo-frei/config.toml`, see `config.example.toml`. `sudo-frei-cli` only reads `hosts`; the TUI also reads `presets`, `default_minutes`, `refresh_seconds` and `script`.
+`~/.config/sudo-frei/config.toml`, see `config.example.toml`. `sudo-frei-cli` reads `hosts`, `status_timeout` and `status_timeout_proxy`; the TUI also reads `presets`, `default_minutes`, `refresh_seconds` and `script`.
+
+`status` asks all hosts at once and reports a host as unreachable after `status_timeout` seconds (default 2.3). Hosts that ssh reaches through a `ProxyJump` or `ProxyCommand` get `status_timeout_proxy` (default 8), because two handshakes rarely fit into the short one.
 
 ## TUI
 

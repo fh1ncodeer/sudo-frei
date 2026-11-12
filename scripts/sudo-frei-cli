@@ -10,6 +10,8 @@
 # hostname means this machine.
 # Hosts come from ~/.config/sudo-frei/config.toml (`hosts = [...]`, see
 # config.example.toml); without it, only this machine.
+# status asks all hosts at once and gives each `status_timeout` seconds (default
+# 2.3), hosts behind an ssh jump host `status_timeout_proxy` (default 8).
 # --raw prints one tab-separated line per host for scripts and the TUI:
 #   HOST<TAB>on<TAB>END_EPOCH | HOST<TAB>off<TAB> | HOST<TAB>orphan<TAB> | HOST<TAB>offline<TAB>
 # (orphan: the rule is in place but its expiry timer is gone; revoke it).
@@ -32,7 +34,9 @@ CONFIG=${SUDO_FREI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sudo-frei/config.to
 FALLBACK_HOSTS=(local)
 DEFAULT_MIN=30
 MAX_MIN=240
+# Seconds per host in `status`; the config can override both.
 STATUS_TIMEOUT=2.3
+STATUS_TIMEOUT_PROXY=8 # hosts behind ProxyJump/ProxyCommand: two ssh handshakes
 
 # Runs on the target host as the login user: bash -c "$REMOTE" sudo-frei ACTION [MINUTES]
 read -r -d '' REMOTE <<'EOF' || true
@@ -208,24 +212,43 @@ EOF
 die() { echo "sudo-frei-cli: $*" >&2; exit 1; }
 usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; }
 
-config_hosts() {
-  if [[ -f $CONFIG ]]; then
-    local hosts
-    hosts=$(python3 -I -c 'import sys, tomllib
-h = tomllib.load(open(sys.argv[1], "rb")).get("hosts") or []
+# read_config: take the hosts and the status timeouts from $CONFIG, if it exists.
+CONFIG_HOSTS=()
+read_config() {
+  [[ -f $CONFIG ]] || return 0
+  local out lines h
+  # Prints the two timeouts (given defaults unless set), then one host per line.
+  out=$(python3 -I -c 'import sys, tomllib
+c = tomllib.load(open(sys.argv[1], "rb"))
+h = c.get("hosts") or []
 if not isinstance(h, list) or not all(isinstance(x, str) for x in h):
     sys.exit("hosts must be a list of strings")
-print(*h, sep="\n")' "$CONFIG") ||
-      die "$CONFIG: could not read hosts."
-    if [[ -n ${hosts//[[:space:]]/} ]]; then
-      grep -v '^[[:space:]]*$' <<<"$hosts"
-      return
-    fi
-  fi
-  printf '%s\n' "${FALLBACK_HOSTS[@]}"
+for key, default in zip(("status_timeout", "status_timeout_proxy"), sys.argv[2:]):
+    v = c.get(key, float(default))
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.1 <= v <= 60:
+        sys.exit(key + " must be a number of seconds between 0.1 and 60")
+    print(f"{v:.3f}")
+print(*h, sep="\n")' "$CONFIG" "$STATUS_TIMEOUT" "$STATUS_TIMEOUT_PROXY") ||
+    die "could not read $CONFIG."
+  mapfile -t lines <<<"$out"
+  STATUS_TIMEOUT=${lines[0]} STATUS_TIMEOUT_PROXY=${lines[1]}
+  for h in "${lines[@]:2}"; do
+    [[ -z ${h//[[:space:]]/} ]] || CONFIG_HOSTS+=("$h")
+  done
 }
 
 is_local() { [[ $1 == local || $1 == "$(uname -n)" ]]; }
+
+# host_timeout HOST: seconds `status` waits for HOST. Going through a jump host
+# takes two ssh handshakes, which the short timeout often cuts off.
+host_timeout() {
+  if ! is_local "$1" && ssh -G -- "$1" 2>/dev/null |
+    awk '($1 == "proxyjump" || $1 == "proxycommand") && $2 != "none" { found = 1 } END { exit !found }'; then
+    echo "$STATUS_TIMEOUT_PROXY"
+  else
+    echo "$STATUS_TIMEOUT"
+  fi
+}
 
 # run_on HOST ACTION [MINUTES]; interactive=1 allocates a tty so sudo can ask for the password.
 run_on() {
@@ -270,17 +293,16 @@ case $action in
     shift
     raw=0
     [[ ${1:-} == --raw ]] && { raw=1; shift; }
+    read_config
     hosts=("$@")
-    if (( ! ${#hosts[@]} )); then
-      list=$(config_hosts) || exit 1
-      mapfile -t hosts <<<"$list"
-    fi
-    # All hosts in parallel, each capped at STATUS_TIMEOUT, printed in the given order.
+    (( ${#hosts[@]} )) || hosts=("${CONFIG_HOSTS[@]}")
+    (( ${#hosts[@]} )) || hosts=("${FALLBACK_HOSTS[@]}")
+    # All hosts in parallel, each capped at its timeout, printed in the given order.
     out=$(mktemp -d)
     trap 'rm -rf "$out"' EXIT
     for i in "${!hosts[@]}"; do
       (
-        timeout "$STATUS_TIMEOUT" "$0" _state1 "${hosts[$i]}" >"$out/$i" 2>/dev/null ||
+        timeout "$(host_timeout "${hosts[$i]}")" "$0" _state1 "${hosts[$i]}" >"$out/$i" 2>/dev/null ||
           echo offline >"$out/$i"
       ) &
     done
